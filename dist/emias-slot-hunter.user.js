@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ЕМИАС: охотник за слотами
 // @namespace    https://github.com/polinalamponi/emias-slot-hunter
-// @version      0.1.8
+// @version      0.1.9
 // @description  Ищет слоты ЕМИАС по специальности, дате и отделению, а также по направлениям и существующим записям
 // @author       polinalamponi
 // @license      MIT
@@ -45,7 +45,7 @@ SOFTWARE.
 (function (root) {
   'use strict';
 
-  const VERSION = '0.1.8';
+  const VERSION = '0.1.9';
   const TZ = 'Europe/Moscow';
 
   function createUtil() {
@@ -696,24 +696,48 @@ SOFTWARE.
 
     const dayOf = (startTime) => Number.isFinite(util.toMs(startTime)) ? util.mskDate(new Date(util.toMs(startTime))) : null;
     const sameSpeciality = (s, appointment) => s.codes.includes(String(id(appointment?.toDoctor?.specialityId)));
-    function appointmentMatches(t, a, c = null) {
+
+    function selectedDays(target) {
+      const dates = Array.isArray(target.days) ? target.days : [target.onlyDay];
+      return [...new Set(dates.filter((day) => typeof day === 'string' &&
+        /^\d{4}-\d{2}-\d{2}$/.test(day) && dayOf(day + 'T12:00:00') === day))].sort();
+    }
+
+    function schedulePeriods(days) {
+      const periods = [];
+      const maxSpanMs = 30 * 24 * 60 * 60 * 1000;
+      for (const day of days) {
+        const last = periods.at(-1);
+        // При большом разбросе дат сохраняем 30-дневное окно обычного поиска.
+        if (last && util.toMs(day + 'T00:00:00') - util.toMs(last.dateFrom + 'T00:00:00') <= maxSpanMs) {
+          last.dateTo = day;
+        } else {
+          periods.push({ dateFrom: day, dateTo: day });
+        }
+      }
+      return periods;
+    }
+
+    function appointmentMatches(t, a, days, c = null) {
       const clinicId = id(a?.lpuId);
-      return sameSpeciality(t.source, a) && dayOf(a.startTime) === t.onlyDay &&
+      return sameSpeciality(t.source, a) && days.has(dayOf(a.startTime)) &&
         (!clinicId || clinicId === t.source.clinic.id || clinicId === c?.lpuId) &&
         sameAddress(a.lpuAddress, t.source.clinic.address) && (!c || util.toMs(a.startTime) === util.toMs(c.slot.startTime));
     }
 
     async function search(t, ctx) {
       const s = t.source;
-      const day = t.onlyDay;
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(day || '') || dayOf(day + 'T12:00:00') !== day ||
-          !s?.clinic?.id || !s.clinic.address || !s.codes?.length || !s.purpose?.id) {
+      const days = selectedDays(t);
+      if (!days.length || !s?.clinic?.id || !s.clinic.address || !s.codes?.length || !s.purpose?.id) {
         return empty(['Выберите специальность, отделение и дату заново.'], 'stopTarget');
       }
-      if (day < util.mskDate(new Date(ctx.now))) return empty(['Выбранная дата уже прошла.'], 'stopTarget');
+      const today = util.mskDate(new Date(ctx.now));
+      const periods = schedulePeriods(days.filter((day) => day >= today));
+      if (!periods.length) return empty(['Все выбранные даты уже прошли.'], 'stopTarget');
       if (await profileKey() !== s.account) return empty(['Выбран другой полис. Откройте «Настроить» для нужного полиса.'], 'stopTarget');
-      if (ctx.appointments.some((a) => appointmentMatches(t, a))) {
-        return empty(['Запись на выбранную дату в этом отделении уже есть.'], 'stopTarget');
+      const dateSet = new Set(days);
+      if (ctx.appointments.some((a) => appointmentMatches(t, a, dateSet))) {
+        return empty(['Запись в этом отделении на одну из выбранных дат уже есть.'], 'stopTarget');
       }
       const resources = await doctorList(s);
       if (!resources.ok) return empty([resources.explained?.message || 'ЕМИАС не отдал список врачей.'], resources.explained?.action);
@@ -723,36 +747,42 @@ SOFTWARE.
       let action = null;
       const available = rooms(resources, s);
       const visited = new Set();
+      const filterTarget = { ...t, onlyDay: null };
+      roomLoop:
       for (const r of available) {
-        if (now() < api.backoffUntil() || ctx.active?.() === false) break;
         const key = r.resourceId + '|' + r.roomId;
         if (visited.has(key)) continue;
         visited.add(key);
-        const schedule = await api.post('v4/saOrchestrator/getAvailableResourceScheduleInfo', {
-          availableResourceId: r.resourceId, complexResourceId: r.roomId, inquiryPurposeId: s.purpose.id,
-          period: { dateFrom: day, dateTo: day },
-        });
-        if (!schedule.ok) {
-          const msg = schedule.explained?.message || 'ЕМИАС не отдал расписание.';
-          if (!notes.includes(msg)) notes.push(msg);
-          action = schedule.explained?.action || action;
-          continue;
+        for (const period of periods) {
+          if (now() < api.backoffUntil() || ctx.active?.() === false) break roomLoop;
+          const schedule = await api.post('v4/saOrchestrator/getAvailableResourceScheduleInfo', {
+            availableResourceId: r.resourceId, complexResourceId: r.roomId, inquiryPurposeId: s.purpose.id, period,
+          });
+          if (!schedule.ok) {
+            const msg = schedule.explained?.message || 'ЕМИАС не отдал расписание.';
+            if (!notes.includes(msg)) notes.push(msg);
+            action = schedule.explained?.action || action;
+            continue;
+          }
+          const info = payload(schedule);
+          if (id(info?.availableResource?.id) && id(info.availableResource.id) !== r.resourceId) continue;
+          const room = items(info?.availableResource?.complexResource).find((c) => id(c?.id) === r.roomId);
+          if (!sameAddress(room?.room?.defaultAddress, s.clinic.address)) continue;
+          const slots = items(info?.scheduleOfDay).flatMap((d) => items(d?.scheduleBySlot))
+            .filter((b) => b?.complexResourceId == null || id(b.complexResourceId) === r.roomId)
+            .flatMap((b) => items(b?.slot)).filter((slot) => {
+              const day = dayOf(slot?.startTime);
+              return dateSet.has(day) && day >= period.dateFrom && day <= period.dateTo &&
+                util.toMs(slot.startTime) >= ctx.now && util.toMs(slot.endTime) > util.toMs(slot.startTime) &&
+                slot.available !== false && !slot.notAvailable && !slot.disabled;
+            });
+          const picked = filters.pickSlots({
+            slots, target: filterTarget, now: ctx.now, appointments: ctx.appointments, addressOf: () => s.clinic.address,
+          });
+          if (picked.skipped && !notes.includes(picked.skipped)) notes.push(picked.skipped);
+          rejected = rejected.concat(picked.rejected);
+          for (const slot of picked.ok) candidates.push({ ...r, complexResourceId: r.roomId, slot, address: s.clinic.address });
         }
-        const info = payload(schedule);
-        if (id(info?.availableResource?.id) && id(info.availableResource.id) !== r.resourceId) continue;
-        const room = items(info?.availableResource?.complexResource).find((c) => id(c?.id) === r.roomId);
-        if (!sameAddress(room?.room?.defaultAddress, s.clinic.address)) continue;
-        const slots = items(info?.scheduleOfDay).flatMap((d) => items(d?.scheduleBySlot))
-          .filter((b) => b?.complexResourceId == null || id(b.complexResourceId) === r.roomId)
-          .flatMap((b) => items(b?.slot)).filter((slot) => dayOf(slot?.startTime) === day &&
-            util.toMs(slot.startTime) >= ctx.now && util.toMs(slot.endTime) > util.toMs(slot.startTime) &&
-            slot.available !== false && !slot.notAvailable && !slot.disabled);
-        const picked = filters.pickSlots({
-          slots, target: t, now: ctx.now, appointments: ctx.appointments, addressOf: () => s.clinic.address,
-        });
-        if (picked.skipped && !notes.includes(picked.skipped)) notes.push(picked.skipped);
-        rejected = rejected.concat(picked.rejected);
-        for (const slot of picked.ok) candidates.push({ ...r, complexResourceId: r.roomId, slot, address: s.clinic.address });
       }
       candidates.sort((a, b) => util.toMs(a.slot.startTime) - util.toMs(b.slot.startTime));
       if (!available.length) notes.push('ЕМИАС пока не показывает врачей в выбранном отделении.');
@@ -761,12 +791,15 @@ SOFTWARE.
 
     async function book(t, cand, ctx) {
       const s = t.source;
-      if (!s?.clinic || !s.codes?.includes(String(cand.code)) || dayOf(cand.slot.startTime) !== t.onlyDay ||
+      const dates = new Set(selectedDays(t));
+      if (!s?.clinic || !s.codes?.includes(String(cand.code)) || !dates.has(dayOf(cand.slot.startTime)) ||
           cand.clinic.id !== s.clinic.id || !sameAddress(cand.address, s.clinic.address) ||
           util.toMs(cand.slot.startTime) <= now()) return fail('Слот больше не соответствует выбранным условиям.', 'retry');
       if (ctx.active?.() === false) return fail('Поиск остановлен.', null);
       if (await profileKey() !== s.account) return fail('Выбран другой полис. Начните поиск заново.');
-      if (ctx.appointments.some((a) => appointmentMatches(t, a))) return fail('Запись на выбранную дату в этом отделении уже есть.');
+      if (ctx.appointments.some((a) => appointmentMatches(t, a, dates))) {
+        return fail('Запись в этом отделении на одну из выбранных дат уже есть.');
+      }
       const check = await api.post('v6/chatBot/check', {
         inquiryPurposeId: s.purpose.id, specialityId: cand.code, lpuId: cand.lpuId,
       });
@@ -798,7 +831,7 @@ SOFTWARE.
       let records;
       try { records = await api.post(apptPath, {}); } catch { records = null; }
       const appointment = items(records?.ok && payload(records)?.appointment).find((a) =>
-        !before.has(id(a.id)) && (!appointmentId || appointmentId === id(a.id)) && appointmentMatches(t, a, cand));
+        !before.has(id(a.id)) && (!appointmentId || appointmentId === id(a.id)) && appointmentMatches(t, a, dates, cand));
       if (appointment) return { ok: true, verified: true, newAppointment: appointment, message: 'ЕМИАС подтвердил запись.' };
       return fail('ЕМИАС не подтвердил запись в списке приёмов. Проверьте раздел «Записи» перед повтором.');
     }
@@ -2011,6 +2044,7 @@ SOFTWARE.
 
     function buildTarget(option, form) {
       const speciality = option.scenario === 'bookSpeciality';
+      const days = speciality ? [...new Set((form.days ?? [form.day]).filter(Boolean))].sort() : [];
       // form.when — три взаимоисключающих варианта:
       //  - 'earlier': раньше текущей записи, день любой (onlyDay=null, anyTime=false);
       //  - 'sameDayEarlier': в тот же день, что текущая запись, но раньше неё
@@ -2021,7 +2055,10 @@ SOFTWARE.
       const currentDay = option.current ? String(option.current).slice(0, 10) : null;
       let onlyDay = null;
       let anyTime = false;
-      if (form.when === 'sameDayEarlier') {
+      if (speciality) {
+        onlyDay = days.length === 1 ? days[0] : null;
+        anyTime = true;
+      } else if (form.when === 'sameDayEarlier') {
         onlyDay = currentDay;
       } else if (form.when === 'onlyDay' || form.when === 'anyTimeOnDay') {
         onlyDay = form.day || null;
@@ -2037,6 +2074,7 @@ SOFTWARE.
         id: option.id, scenario: option.scenario, title: option.title, source: option.source,
         current: option.current || null,
         onlyDay,
+        ...(days.length > 1 ? { days } : {}),
         anyTime,
         dateFrom: form.dateFrom || null,
         dateTo,
@@ -2066,6 +2104,7 @@ SOFTWARE.
 
     function describeTarget(t) {
       const parts = [];
+      const days = t.scenario === 'bookSpeciality' && Array.isArray(t.days) ? t.days : [];
       if (t.scenario === 'bookSpeciality') {
         parts.push(t.source.clinic.title + ' — ' + t.source.clinic.address, t.source.purpose.title);
       }
@@ -2079,7 +2118,8 @@ SOFTWARE.
       // без текущей записи (запись по направлению) не говорит о датах ничего.
       // Для bookDoctor и bookLdp дата уже называется в head ниже («…по направлению до …»).
       const byReferral = t.scenario === 'bookDoctor' || t.scenario === 'bookLdp';
-      if (!t.onlyDay && !byReferral) {
+      if (days.length) parts.push('выбранные даты ' + days.map(dayHuman).join(', '));
+      if (!t.onlyDay && !byReferral && !days.length) {
         const last = t.dateTo || t.deadline || null;
         if (t.dateFrom && last) parts.push(`с ${dayHuman(t.dateFrom)} по ${dayHuman(last)}`);
         else if (t.dateFrom) parts.push(`с ${dayHuman(t.dateFrom)}`);
@@ -2380,6 +2420,9 @@ SOFTWARE.
       .esh-speciality-select { width: 100%; box-sizing: border-box; padding: 8px; font: inherit; }
       .esh-target-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
       .esh-target-head .esh-btn { flex: none; padding: 4px 6px; }
+      .esh-date-row { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+      .esh-date-row input { flex: 1; min-width: 0; }
+      .esh-date-row .esh-btn { flex: none; padding: 4px 6px; }
       .esh-card input[type=text], .esh-card input[type=date], .esh-card input[type=time] { width: 100%; padding: 4px 6px; margin-top: 4px; font-size: 13px; border: 1px solid #ccc; border-radius: 6px; }
       .esh-btns { display: flex; gap: 8px; margin-top: 12px; }
       .esh-btn { flex: 1; padding: 8px 10px; border-radius: 8px; border: 1px solid #ccc; background: #f4f4f4; cursor: pointer; font-size: 13px; }
@@ -2825,6 +2868,7 @@ SOFTWARE.
         // Для новой записи 'earlier' показывается как «как можно раньше».
         when: option.scenario === 'bookSpeciality' ? 'onlyDay' : 'earlier',
         day: '', dateFrom: '', dateTo: '', timeFrom: '', timeTo: '',
+        ...(option.scenario === 'bookSpeciality' ? { days: [''] } : {}),
         where: option.address ? 'sameCampus' : 'any', addressContains: '',
         respectTravel: option.scenario !== 'bookSpeciality',
         mode: option.scenario === 'bookSpeciality' ? 'confirm' : 'auto', purpose: 'unwell',
@@ -2897,6 +2941,34 @@ SOFTWARE.
     ]);
   }
 
+  function specialityDateFields(form, update, quiet) {
+    const today = core.today();
+    const add = h('button', {
+      class: 'esh-btn', text: 'Добавить дату', disabled: form.days.some((day) => !day),
+      onclick: () => update({ days: [...form.days, ''] }),
+    });
+    const rows = form.days.map((day, index) => h('div', { class: 'esh-date-row' }, [
+      h('input', {
+        type: 'date', min: today, value: day, 'aria-label': 'Дата приёма ' + (index + 1),
+        onchange: (event) => {
+          const days = form.days.slice();
+          days[index] = event.target.value;
+          add.disabled = days.some((value) => !value);
+          quiet({ days });
+        },
+      }),
+      form.days.length > 1 ? h('button', {
+        class: 'esh-btn', text: '×', 'aria-label': 'Убрать дату ' + (index + 1),
+        onclick: () => update({ days: form.days.filter((_, i) => i !== index) }),
+      }) : null,
+    ]));
+    return h('div', {}, [
+      h('div', { class: 'esh-field', text: 'Даты приёма' }),
+      ...rows,
+      add,
+    ]);
+  }
+
   function renderTargetCard(option) {
     const form = ensureForm(option);
     const update = (patch) => { Object.assign(form, patch); renderStep2(wizard.selected); };
@@ -2919,10 +2991,7 @@ SOFTWARE.
       ]));
       card.appendChild(h('p', { class: 'esh-note', text: clinic.title + ' — ' + clinic.address }));
       card.appendChild(h('p', { class: 'esh-note', text: option.source.purpose.title }));
-      card.appendChild(h('label', { class: 'esh-field' }, [
-        'Дата приёма',
-        h('input', { type: 'date', min: core.today(), value: form.day, onchange: (e) => quiet({ day: e.target.value }) }),
-      ]));
+      card.appendChild(specialityDateFields(form, update, quiet));
     } else {
       card.appendChild(title);
       card.appendChild(h('label', { class: 'esh-field', text: 'Когда' }));
@@ -2956,7 +3025,12 @@ SOFTWARE.
   }
 
   function stepTwoError(option, form) {
-    if (option.scenario === 'bookSpeciality' && form.day && form.day < core.today()) return 'выберите сегодняшнюю или будущую дату';
+    if (option.scenario === 'bookSpeciality') {
+      const days = form.days.filter(Boolean);
+      if (!days.length) return 'выберите хотя бы одну дату';
+      const today = core.today();
+      return days.some((day) => day < today) ? 'выберите сегодняшние или будущие даты' : null;
+    }
     if (form.when === 'onlyDay' && !form.day) return 'выберите день';
     if (form.where === 'contains' && !form.addressContains.trim()) return 'укажите часть адреса';
     return null;

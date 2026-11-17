@@ -25,6 +25,7 @@
 
     function buildTarget(option, form) {
       const speciality = option.scenario === 'bookSpeciality';
+      const days = speciality ? [...new Set((form.days ?? [form.day]).filter(Boolean))].sort() : [];
       // form.when — три взаимоисключающих варианта:
       //  - 'earlier': раньше текущей записи, день любой (onlyDay=null, anyTime=false);
       //  - 'sameDayEarlier': в тот же день, что текущая запись, но раньше неё
@@ -35,7 +36,10 @@
       const currentDay = option.current ? String(option.current).slice(0, 10) : null;
       let onlyDay = null;
       let anyTime = false;
-      if (form.when === 'sameDayEarlier') {
+      if (speciality) {
+        onlyDay = days.length === 1 ? days[0] : null;
+        anyTime = true;
+      } else if (form.when === 'sameDayEarlier') {
         onlyDay = currentDay;
       } else if (form.when === 'onlyDay' || form.when === 'anyTimeOnDay') {
         onlyDay = form.day || null;
@@ -51,6 +55,7 @@
         id: option.id, scenario: option.scenario, title: option.title, source: option.source,
         current: option.current || null,
         onlyDay,
+        ...(days.length > 1 ? { days } : {}),
         anyTime,
         dateFrom: form.dateFrom || null,
         dateTo,
@@ -80,6 +85,7 @@
 
     function describeTarget(t) {
       const parts = [];
+      const days = t.scenario === 'bookSpeciality' && Array.isArray(t.days) ? t.days : [];
       if (t.scenario === 'bookSpeciality') {
         parts.push(t.source.clinic.title + ' — ' + t.source.clinic.address, t.source.purpose.title);
       }
@@ -93,7 +99,8 @@
       // без текущей записи (запись по направлению) не говорит о датах ничего.
       // Для bookDoctor и bookLdp дата уже называется в head ниже («…по направлению до …»).
       const byReferral = t.scenario === 'bookDoctor' || t.scenario === 'bookLdp';
-      if (!t.onlyDay && !byReferral) {
+      if (days.length) parts.push('выбранные даты ' + days.map(dayHuman).join(', '));
+      if (!t.onlyDay && !byReferral && !days.length) {
         const last = t.dateTo || t.deadline || null;
         if (t.dateFrom && last) parts.push(`с ${dayHuman(t.dateFrom)} по ${dayHuman(last)}`);
         else if (t.dateFrom) parts.push(`с ${dayHuman(t.dateFrom)}`);

@@ -133,24 +133,48 @@
 
     const dayOf = (startTime) => Number.isFinite(util.toMs(startTime)) ? util.mskDate(new Date(util.toMs(startTime))) : null;
     const sameSpeciality = (s, appointment) => s.codes.includes(String(id(appointment?.toDoctor?.specialityId)));
-    function appointmentMatches(t, a, c = null) {
+
+    function selectedDays(target) {
+      const dates = Array.isArray(target.days) ? target.days : [target.onlyDay];
+      return [...new Set(dates.filter((day) => typeof day === 'string' &&
+        /^\d{4}-\d{2}-\d{2}$/.test(day) && dayOf(day + 'T12:00:00') === day))].sort();
+    }
+
+    function schedulePeriods(days) {
+      const periods = [];
+      const maxSpanMs = 30 * 24 * 60 * 60 * 1000;
+      for (const day of days) {
+        const last = periods.at(-1);
+        // При большом разбросе дат сохраняем 30-дневное окно обычного поиска.
+        if (last && util.toMs(day + 'T00:00:00') - util.toMs(last.dateFrom + 'T00:00:00') <= maxSpanMs) {
+          last.dateTo = day;
+        } else {
+          periods.push({ dateFrom: day, dateTo: day });
+        }
+      }
+      return periods;
+    }
+
+    function appointmentMatches(t, a, days, c = null) {
       const clinicId = id(a?.lpuId);
-      return sameSpeciality(t.source, a) && dayOf(a.startTime) === t.onlyDay &&
+      return sameSpeciality(t.source, a) && days.has(dayOf(a.startTime)) &&
         (!clinicId || clinicId === t.source.clinic.id || clinicId === c?.lpuId) &&
         sameAddress(a.lpuAddress, t.source.clinic.address) && (!c || util.toMs(a.startTime) === util.toMs(c.slot.startTime));
     }
 
     async function search(t, ctx) {
       const s = t.source;
-      const day = t.onlyDay;
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(day || '') || dayOf(day + 'T12:00:00') !== day ||
-          !s?.clinic?.id || !s.clinic.address || !s.codes?.length || !s.purpose?.id) {
+      const days = selectedDays(t);
+      if (!days.length || !s?.clinic?.id || !s.clinic.address || !s.codes?.length || !s.purpose?.id) {
         return empty(['Выберите специальность, отделение и дату заново.'], 'stopTarget');
       }
-      if (day < util.mskDate(new Date(ctx.now))) return empty(['Выбранная дата уже прошла.'], 'stopTarget');
+      const today = util.mskDate(new Date(ctx.now));
+      const periods = schedulePeriods(days.filter((day) => day >= today));
+      if (!periods.length) return empty(['Все выбранные даты уже прошли.'], 'stopTarget');
       if (await profileKey() !== s.account) return empty(['Выбран другой полис. Откройте «Настроить» для нужного полиса.'], 'stopTarget');
-      if (ctx.appointments.some((a) => appointmentMatches(t, a))) {
-        return empty(['Запись на выбранную дату в этом отделении уже есть.'], 'stopTarget');
+      const dateSet = new Set(days);
+      if (ctx.appointments.some((a) => appointmentMatches(t, a, dateSet))) {
+        return empty(['Запись в этом отделении на одну из выбранных дат уже есть.'], 'stopTarget');
       }
       const resources = await doctorList(s);
       if (!resources.ok) return empty([resources.explained?.message || 'ЕМИАС не отдал список врачей.'], resources.explained?.action);
@@ -160,36 +184,42 @@
       let action = null;
       const available = rooms(resources, s);
       const visited = new Set();
+      const filterTarget = { ...t, onlyDay: null };
+      roomLoop:
       for (const r of available) {
-        if (now() < api.backoffUntil() || ctx.active?.() === false) break;
         const key = r.resourceId + '|' + r.roomId;
         if (visited.has(key)) continue;
         visited.add(key);
-        const schedule = await api.post('v4/saOrchestrator/getAvailableResourceScheduleInfo', {
-          availableResourceId: r.resourceId, complexResourceId: r.roomId, inquiryPurposeId: s.purpose.id,
-          period: { dateFrom: day, dateTo: day },
-        });
-        if (!schedule.ok) {
-          const msg = schedule.explained?.message || 'ЕМИАС не отдал расписание.';
-          if (!notes.includes(msg)) notes.push(msg);
-          action = schedule.explained?.action || action;
-          continue;
+        for (const period of periods) {
+          if (now() < api.backoffUntil() || ctx.active?.() === false) break roomLoop;
+          const schedule = await api.post('v4/saOrchestrator/getAvailableResourceScheduleInfo', {
+            availableResourceId: r.resourceId, complexResourceId: r.roomId, inquiryPurposeId: s.purpose.id, period,
+          });
+          if (!schedule.ok) {
+            const msg = schedule.explained?.message || 'ЕМИАС не отдал расписание.';
+            if (!notes.includes(msg)) notes.push(msg);
+            action = schedule.explained?.action || action;
+            continue;
+          }
+          const info = payload(schedule);
+          if (id(info?.availableResource?.id) && id(info.availableResource.id) !== r.resourceId) continue;
+          const room = items(info?.availableResource?.complexResource).find((c) => id(c?.id) === r.roomId);
+          if (!sameAddress(room?.room?.defaultAddress, s.clinic.address)) continue;
+          const slots = items(info?.scheduleOfDay).flatMap((d) => items(d?.scheduleBySlot))
+            .filter((b) => b?.complexResourceId == null || id(b.complexResourceId) === r.roomId)
+            .flatMap((b) => items(b?.slot)).filter((slot) => {
+              const day = dayOf(slot?.startTime);
+              return dateSet.has(day) && day >= period.dateFrom && day <= period.dateTo &&
+                util.toMs(slot.startTime) >= ctx.now && util.toMs(slot.endTime) > util.toMs(slot.startTime) &&
+                slot.available !== false && !slot.notAvailable && !slot.disabled;
+            });
+          const picked = filters.pickSlots({
+            slots, target: filterTarget, now: ctx.now, appointments: ctx.appointments, addressOf: () => s.clinic.address,
+          });
+          if (picked.skipped && !notes.includes(picked.skipped)) notes.push(picked.skipped);
+          rejected = rejected.concat(picked.rejected);
+          for (const slot of picked.ok) candidates.push({ ...r, complexResourceId: r.roomId, slot, address: s.clinic.address });
         }
-        const info = payload(schedule);
-        if (id(info?.availableResource?.id) && id(info.availableResource.id) !== r.resourceId) continue;
-        const room = items(info?.availableResource?.complexResource).find((c) => id(c?.id) === r.roomId);
-        if (!sameAddress(room?.room?.defaultAddress, s.clinic.address)) continue;
-        const slots = items(info?.scheduleOfDay).flatMap((d) => items(d?.scheduleBySlot))
-          .filter((b) => b?.complexResourceId == null || id(b.complexResourceId) === r.roomId)
-          .flatMap((b) => items(b?.slot)).filter((slot) => dayOf(slot?.startTime) === day &&
-            util.toMs(slot.startTime) >= ctx.now && util.toMs(slot.endTime) > util.toMs(slot.startTime) &&
-            slot.available !== false && !slot.notAvailable && !slot.disabled);
-        const picked = filters.pickSlots({
-          slots, target: t, now: ctx.now, appointments: ctx.appointments, addressOf: () => s.clinic.address,
-        });
-        if (picked.skipped && !notes.includes(picked.skipped)) notes.push(picked.skipped);
-        rejected = rejected.concat(picked.rejected);
-        for (const slot of picked.ok) candidates.push({ ...r, complexResourceId: r.roomId, slot, address: s.clinic.address });
       }
       candidates.sort((a, b) => util.toMs(a.slot.startTime) - util.toMs(b.slot.startTime));
       if (!available.length) notes.push('ЕМИАС пока не показывает врачей в выбранном отделении.');
@@ -198,12 +228,15 @@
 
     async function book(t, cand, ctx) {
       const s = t.source;
-      if (!s?.clinic || !s.codes?.includes(String(cand.code)) || dayOf(cand.slot.startTime) !== t.onlyDay ||
+      const dates = new Set(selectedDays(t));
+      if (!s?.clinic || !s.codes?.includes(String(cand.code)) || !dates.has(dayOf(cand.slot.startTime)) ||
           cand.clinic.id !== s.clinic.id || !sameAddress(cand.address, s.clinic.address) ||
           util.toMs(cand.slot.startTime) <= now()) return fail('Слот больше не соответствует выбранным условиям.', 'retry');
       if (ctx.active?.() === false) return fail('Поиск остановлен.', null);
       if (await profileKey() !== s.account) return fail('Выбран другой полис. Начните поиск заново.');
-      if (ctx.appointments.some((a) => appointmentMatches(t, a))) return fail('Запись на выбранную дату в этом отделении уже есть.');
+      if (ctx.appointments.some((a) => appointmentMatches(t, a, dates))) {
+        return fail('Запись в этом отделении на одну из выбранных дат уже есть.');
+      }
       const check = await api.post('v6/chatBot/check', {
         inquiryPurposeId: s.purpose.id, specialityId: cand.code, lpuId: cand.lpuId,
       });
@@ -235,7 +268,7 @@
       let records;
       try { records = await api.post(apptPath, {}); } catch { records = null; }
       const appointment = items(records?.ok && payload(records)?.appointment).find((a) =>
-        !before.has(id(a.id)) && (!appointmentId || appointmentId === id(a.id)) && appointmentMatches(t, a, cand));
+        !before.has(id(a.id)) && (!appointmentId || appointmentId === id(a.id)) && appointmentMatches(t, a, dates, cand));
       if (appointment) return { ok: true, verified: true, newAppointment: appointment, message: 'ЕМИАС подтвердил запись.' };
       return fail('ЕМИАС не подтвердил запись в списке приёмов. Проверьте раздел «Записи» перед повтором.');
     }

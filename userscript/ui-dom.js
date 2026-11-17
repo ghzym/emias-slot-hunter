@@ -220,6 +220,9 @@
       .esh-speciality-select { width: 100%; box-sizing: border-box; padding: 8px; font: inherit; }
       .esh-target-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
       .esh-target-head .esh-btn { flex: none; padding: 4px 6px; }
+      .esh-date-row { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+      .esh-date-row input { flex: 1; min-width: 0; }
+      .esh-date-row .esh-btn { flex: none; padding: 4px 6px; }
       .esh-card input[type=text], .esh-card input[type=date], .esh-card input[type=time] { width: 100%; padding: 4px 6px; margin-top: 4px; font-size: 13px; border: 1px solid #ccc; border-radius: 6px; }
       .esh-btns { display: flex; gap: 8px; margin-top: 12px; }
       .esh-btn { flex: 1; padding: 8px 10px; border-radius: 8px; border: 1px solid #ccc; background: #f4f4f4; cursor: pointer; font-size: 13px; }
@@ -665,6 +668,7 @@
         // Для новой записи 'earlier' показывается как «как можно раньше».
         when: option.scenario === 'bookSpeciality' ? 'onlyDay' : 'earlier',
         day: '', dateFrom: '', dateTo: '', timeFrom: '', timeTo: '',
+        ...(option.scenario === 'bookSpeciality' ? { days: [''] } : {}),
         where: option.address ? 'sameCampus' : 'any', addressContains: '',
         respectTravel: option.scenario !== 'bookSpeciality',
         mode: option.scenario === 'bookSpeciality' ? 'confirm' : 'auto', purpose: 'unwell',
@@ -737,6 +741,34 @@
     ]);
   }
 
+  function specialityDateFields(form, update, quiet) {
+    const today = core.today();
+    const add = h('button', {
+      class: 'esh-btn', text: 'Добавить дату', disabled: form.days.some((day) => !day),
+      onclick: () => update({ days: [...form.days, ''] }),
+    });
+    const rows = form.days.map((day, index) => h('div', { class: 'esh-date-row' }, [
+      h('input', {
+        type: 'date', min: today, value: day, 'aria-label': 'Дата приёма ' + (index + 1),
+        onchange: (event) => {
+          const days = form.days.slice();
+          days[index] = event.target.value;
+          add.disabled = days.some((value) => !value);
+          quiet({ days });
+        },
+      }),
+      form.days.length > 1 ? h('button', {
+        class: 'esh-btn', text: '×', 'aria-label': 'Убрать дату ' + (index + 1),
+        onclick: () => update({ days: form.days.filter((_, i) => i !== index) }),
+      }) : null,
+    ]));
+    return h('div', {}, [
+      h('div', { class: 'esh-field', text: 'Даты приёма' }),
+      ...rows,
+      add,
+    ]);
+  }
+
   function renderTargetCard(option) {
     const form = ensureForm(option);
     const update = (patch) => { Object.assign(form, patch); renderStep2(wizard.selected); };
@@ -759,10 +791,7 @@
       ]));
       card.appendChild(h('p', { class: 'esh-note', text: clinic.title + ' — ' + clinic.address }));
       card.appendChild(h('p', { class: 'esh-note', text: option.source.purpose.title }));
-      card.appendChild(h('label', { class: 'esh-field' }, [
-        'Дата приёма',
-        h('input', { type: 'date', min: core.today(), value: form.day, onchange: (e) => quiet({ day: e.target.value }) }),
-      ]));
+      card.appendChild(specialityDateFields(form, update, quiet));
     } else {
       card.appendChild(title);
       card.appendChild(h('label', { class: 'esh-field', text: 'Когда' }));
@@ -796,7 +825,12 @@
   }
 
   function stepTwoError(option, form) {
-    if (option.scenario === 'bookSpeciality' && form.day && form.day < core.today()) return 'выберите сегодняшнюю или будущую дату';
+    if (option.scenario === 'bookSpeciality') {
+      const days = form.days.filter(Boolean);
+      if (!days.length) return 'выберите хотя бы одну дату';
+      const today = core.today();
+      return days.some((day) => day < today) ? 'выберите сегодняшние или будущие даты' : null;
+    }
     if (form.when === 'onlyDay' && !form.day) return 'выберите день';
     if (form.where === 'contains' && !form.addressContains.trim()) return 'укажите часть адреса';
     return null;

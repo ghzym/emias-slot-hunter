@@ -97,6 +97,47 @@ test('проверяет только выбранный корпус и ден�
   assert.equal(calls[1].body.complexResourceId, 30);
 });
 
+test('из диапазона расписания выбирает только указанные дни и проверяет отдалённые даты отдельно', async () => {
+  const later = '2026-11-22';
+  const distant = '2026-12-27';
+  const makeSlot = (date) => ({ startTime: date + 'T09:00:00', endTime: date + 'T09:15:00' });
+  const { service, calls } = fixture({
+    [endpoints.doctors]: ok({ doctorsInfo: [{ lpuId: 10, availableResources: [doctor(20, [room(30, address)])] }] }),
+    [endpoints.schedule]: ({ period }) => ok({
+      availableResource: { complexResource: [room(30, address)] },
+      scheduleOfDay: [{ scheduleBySlot: [{ complexResourceId: 30, slot: period.dateFrom === distant
+        ? [makeSlot(distant)] : [makeSlot(later), makeSlot('2026-11-21'), slot] }] }],
+    }),
+  });
+  const result = await service.search({ ...target, onlyDay: null,
+    days: [later, distant, day, '2026-11-18', day] }, ctx);
+  assert.deepEqual(calls.slice(1).map((call) => call.body.period), [
+    { dateFrom: day, dateTo: later }, { dateFrom: distant, dateTo: distant },
+  ]);
+  assert.deepEqual(result.candidates.map((c) => c.slot.startTime), [startTime, makeSlot(later).startTime, makeSlot(distant).startTime]);
+});
+
+test('позволяет запись на второй выбранный день и не принимает дату между выбранными', async () => {
+  const later = '2026-11-22';
+  const multi = { ...target, onlyDay: null, days: [day, later] };
+  const changeDay = (when) => ({ startTime: when + 'T10:00:00', endTime: when + 'T10:15:00' });
+  const { service, calls } = fixture({
+    [endpoints.check]: ok({ inquiryPurposeBlock: false }),
+    [endpoints.book]: ok({ appointmentId: record.id }),
+    [endpoints.records]: ok({ appointment: [{ ...record, startTime: changeDay(later).startTime }] }),
+  });
+  const outside = await service.book(multi, { ...candidate, slot: changeDay('2026-11-21') }, ctx);
+  assert.equal(outside.ok, false);
+  assert.deepEqual(calls, []);
+  const alreadyBooked = await service.book(multi, { ...candidate, slot: changeDay(later) },
+    { ...ctx, appointments: [record] });
+  assert.equal(alreadyBooked.action, 'stopTarget');
+  assert.deepEqual(calls, []);
+  const res = await service.book(multi, { ...candidate, slot: changeDay(later) }, ctx);
+  assert.equal(res.verified, true);
+  assert.equal(calls[1].body.startTime, changeDay(later).startTime);
+});
+
 test('отправляет запись на найденный слот и проверяет подтверждение в списке ЕМИАС', async () => {
   const { service, calls } = fixture({
     [endpoints.check]: ok({ inquiryPurposeBlock: false }),
@@ -152,4 +193,18 @@ test('мастер сохраняет выбранный день и полны�
   assert.equal(built.mode, 'auto');
   assert.equal(built.addressContains, null);
   assert.match(ui.describeTarget(built), /корпус 1/);
+});
+
+test('мастер объединяет даты в одной цели, удаляет пустые поля и повторы', () => {
+  const ui = createUiState();
+  const option = { ...target, title: 'Дерматовенеролог', address: clinic.address };
+  const form = { when: 'onlyDay', where: 'sameCampus', mode: 'auto' };
+  const built = ui.buildTarget(option, { ...form, days: ['2026-11-22', '', day, day] });
+  assert.deepEqual(built.days, [day, '2026-11-22']);
+  assert.equal(built.onlyDay, null);
+  assert.equal(built.keepImproving, false);
+  assert.match(ui.describeTarget(built), /20 ноября, 22 ноября/);
+  const single = ui.buildTarget(option, { ...form, days: ['', day, day] });
+  assert.equal(single.onlyDay, day);
+  assert.equal(Object.hasOwn(single, 'days'), false);
 });
