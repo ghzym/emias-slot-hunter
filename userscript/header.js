@@ -2,13 +2,13 @@
 // ==UserScript==
 // @name         ЕМИАС: охотник за слотами
 // @namespace    https://github.com/polinalamponi/emias-slot-hunter
-// @version      0.1.5
-// @description  Следит за расписанием ЕМИАС и ловит освободившиеся слоты: записывает по направлению и переносит записи на более раннее время
+// @version      0.1.6
+// @description  Ищет слоты ЕМИАС по направлениям и записям. Открывает самостоятельную запись по выбранной специальности
 // @author       polinalamponi
+// @license      MIT
 // @homepageURL  https://github.com/polinalamponi/emias-slot-hunter
 // @supportURL   https://github.com/polinalamponi/emias-slot-hunter/issues
-// @updateURL    https://raw.githubusercontent.com/polinalamponi/emias-slot-hunter/main/dist/emias-slot-hunter.user.js
-// @downloadURL  https://raw.githubusercontent.com/polinalamponi/emias-slot-hunter/main/dist/emias-slot-hunter.user.js
+// @downloadURL  none
 // @match        https://emias.info/*
 // @run-at       document-idle
 // @grant        none

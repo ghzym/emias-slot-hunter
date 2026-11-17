@@ -20,7 +20,8 @@ const parts = ORDER
   .filter((f) => fs.existsSync(path.join(ROOT, f)))
   .map((f) => `/* ---- ${f} ---- */\n${fs.readFileSync(path.join(ROOT, f), 'utf8')}`);
 
-const bundle = `${header}\n\n(function () {\n'use strict';\n${parts.join('\n')}\n})();\n`;
+const license = fs.readFileSync(path.join(ROOT, 'LICENSE'), 'utf8').trim();
+const bundle = `${header}\n\n/*\n${license}\n*/\n\n(function () {\n'use strict';\n${parts.join('\n')}\n})();\n`;
 
 fs.mkdirSync(path.join(ROOT, 'dist'), { recursive: true });
 fs.writeFileSync(path.join(ROOT, 'dist/emias-slot-hunter.user.js'), bundle);

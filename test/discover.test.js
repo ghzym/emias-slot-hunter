@@ -12,6 +12,35 @@ const api = {
   },
 };
 
+test('показывает специальности из каталога ЕМИАС со штатными кодами перехода', async () => {
+  const api = {
+    post: async (path, body) => {
+      assert.equal(path, 'v7/saOrchestrator/getSpecialitiesInfo');
+      assert.deepEqual(body, { isChatBotEnabled: false });
+      return { ok: true, json: { payload: [
+        { title: 'Терапевт', specialities: [{ specialityCode: 200 }, { specialityCode: '201' }] },
+        { title: 'Хирург', specialities: [{ specialityCode: '201' }, { specialityCode: '220' }] },
+        { code: 'pin', title: 'Справки', specialities: [{ specialityCode: '900' }] },
+        { title: 'Без кода', specialities: [{ specialityCode: 'bad&ap=1' }] },
+        { title: 'Гинеколог', specialities: [{ specialityCode: '210' }] },
+      ] } };
+    },
+  };
+  assert.deepEqual(await createDiscover({ api }).listSpecialities(), [
+    { code: '210', title: 'Гинеколог' },
+    { code: '200', title: 'Терапевт' },
+    { code: '220', title: 'Хирург' },
+  ]);
+});
+
+test('отличает пустой список специальностей от сбоя ЕМИАС', async () => {
+  const discoverFor = (result) => createDiscover({ api: { post: async () => result } });
+  assert.deepEqual(await discoverFor({ ok: true, json: { payload: [] } }).listSpecialities(), []);
+  await assert.rejects(discoverFor({ ok: true, json: { payload: {} } }).listSpecialities(), /неизвестном формате/);
+  await assert.rejects(discoverFor({ ok: false, explained: { message: 'ЕМИАС временно недоступен' } }).listSpecialities(),
+    /ЕМИАС временно недоступен/);
+});
+
 test('находит запись на кровь как цель переноса и направление как цель записи', async () => {
   const list = await createDiscover({ api }).list();
   const lab = list.find((o) => o.scenario === 'shiftLab');

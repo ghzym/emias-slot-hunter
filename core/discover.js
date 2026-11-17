@@ -98,7 +98,30 @@
       return out;
     }
 
-    return { list };
+    async function listSpecialities() {
+      const res = await api.post('v7/saOrchestrator/getSpecialitiesInfo', { isChatBotEnabled: false });
+      if (!res.ok) {
+        throw new Error(res.explained?.message || 'ЕМИАС не отдал список специальностей');
+      }
+      const groups = res.json?.payload;
+      if (!Array.isArray(groups)) throw new Error('ЕМИАС вернул список специальностей в неизвестном формате');
+
+      const choices = [];
+      const seen = new Set();
+      for (const group of groups) {
+        const codes = (Array.isArray(group?.specialities) ? group.specialities : [])
+          .map((item) => String(item?.specialityCode ?? ''))
+          .filter((code) => /^\d+$/.test(code));
+        // ЕМИАС открывает первую группу, в которой встречается код.
+        const code = codes.find((value) => !seen.has(value));
+        for (const value of codes) seen.add(value);
+        const title = typeof group?.title === 'string' ? group.title.trim() : '';
+        if (code && title && group.code !== 'pin') choices.push({ code, title });
+      }
+      return choices.sort((a, b) => a.title.localeCompare(b.title, 'ru'));
+    }
+
+    return { list, listSpecialities };
   }
 
   const api = { createDiscover };

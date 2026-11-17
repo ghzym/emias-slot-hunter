@@ -1,18 +1,42 @@
 // ==UserScript==
 // @name         ЕМИАС: охотник за слотами
 // @namespace    https://github.com/polinalamponi/emias-slot-hunter
-// @version      0.1.5
-// @description  Следит за расписанием ЕМИАС и ловит освободившиеся слоты: записывает по направлению и переносит записи на более раннее время
+// @version      0.1.6
+// @description  Ищет слоты ЕМИАС по направлениям и записям. Открывает самостоятельную запись по выбранной специальности
 // @author       polinalamponi
+// @license      MIT
 // @homepageURL  https://github.com/polinalamponi/emias-slot-hunter
 // @supportURL   https://github.com/polinalamponi/emias-slot-hunter/issues
-// @updateURL    https://raw.githubusercontent.com/polinalamponi/emias-slot-hunter/main/dist/emias-slot-hunter.user.js
-// @downloadURL  https://raw.githubusercontent.com/polinalamponi/emias-slot-hunter/main/dist/emias-slot-hunter.user.js
+// @downloadURL  none
 // @match        https://emias.info/*
 // @run-at       document-idle
 // @grant        none
 // @noframes
 // ==/UserScript==
+
+/*
+MIT License
+
+Copyright (c) 2026 Polina
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*/
 
 (function () {
 'use strict';
@@ -21,7 +45,7 @@
 (function (root) {
   'use strict';
 
-  const VERSION = '0.1.5';
+  const VERSION = '0.1.6';
   const TZ = 'Europe/Moscow';
 
   function createUtil() {
@@ -485,7 +509,30 @@
       return out;
     }
 
-    return { list };
+    async function listSpecialities() {
+      const res = await api.post('v7/saOrchestrator/getSpecialitiesInfo', { isChatBotEnabled: false });
+      if (!res.ok) {
+        throw new Error(res.explained?.message || 'ЕМИАС не отдал список специальностей');
+      }
+      const groups = res.json?.payload;
+      if (!Array.isArray(groups)) throw new Error('ЕМИАС вернул список специальностей в неизвестном формате');
+
+      const choices = [];
+      const seen = new Set();
+      for (const group of groups) {
+        const codes = (Array.isArray(group?.specialities) ? group.specialities : [])
+          .map((item) => String(item?.specialityCode ?? ''))
+          .filter((code) => /^\d+$/.test(code));
+        // ЕМИАС открывает первую группу, в которой встречается код.
+        const code = codes.find((value) => !seen.has(value));
+        for (const value of codes) seen.add(value);
+        const title = typeof group?.title === 'string' ? group.title.trim() : '';
+        if (code && title && group.code !== 'pin') choices.push({ code, title });
+      }
+      return choices.sort((a, b) => a.title.localeCompare(b.title, 'ru'));
+    }
+
+    return { list, listSpecialities };
   }
 
   const api = { createDiscover };
@@ -1572,6 +1619,10 @@
     return {
       init,
       discover: () => discover.list(),
+      listSpecialities: async () => {
+        await init();
+        return discover.listSpecialities();
+      },
       setTargets: (list) => runner.setTargets(list.map(normalizeTarget)),
       dryRun: () => runner.dryRun(),
       confirmDryRun: (id) => runner.confirmDryRun(id),
@@ -1989,6 +2040,7 @@
       .esh-opt .meta { font-size: 12px; color: #666; }
       .esh-opt .reason { font-size: 12px; color: #a33; }
       .esh-field { display: block; font-size: 12px; margin: 6px 0 2px; color: #444; }
+      .esh-speciality-select { width: 100%; box-sizing: border-box; padding: 8px; font: inherit; }
       .esh-card input[type=text], .esh-card input[type=date], .esh-card input[type=time] { width: 100%; padding: 4px 6px; margin-top: 4px; font-size: 13px; border: 1px solid #ccc; border-radius: 6px; }
       .esh-btns { display: flex; gap: 8px; margin-top: 12px; }
       .esh-btn { flex: 1; padding: 8px 10px; border-radius: 8px; border: 1px solid #ccc; background: #f4f4f4; cursor: pointer; font-size: 13px; }
@@ -2311,6 +2363,9 @@
   function renderStep1(options) {
     clear(dom.panel);
     dom.panel.appendChild(h('h3', { text: 'Шаг 1 из 3. За чем следить' }));
+    dom.panel.appendChild(h('div', { class: 'esh-btns' }, [
+      h('button', { class: 'esh-btn', text: 'Записаться по специальности', onclick: loadSpecialities }),
+    ]));
     if (!options.length) {
       dom.panel.appendChild(h('p', { class: 'esh-note', text: 'Направлений и записей, с которыми можно работать, не найдено.' }));
     }
@@ -2322,6 +2377,48 @@
     });
     dom.step1Next = next;
     dom.panel.appendChild(h('div', { class: 'esh-btns' }, [next]));
+  }
+
+  async function loadSpecialities() {
+    const heading = 'Запись по специальности';
+    const back = h('button', { class: 'esh-btn', text: 'Назад', onclick: backToStep1 });
+    renderLoading(heading);
+    const requestHeading = dom.panel.firstChild;
+    dom.panel.appendChild(h('div', { class: 'esh-btns' }, [back]));
+    let choices;
+    try {
+      choices = await core.listSpecialities();
+    } catch (error) {
+      if (panelMode !== 'wizard' || dom.panel.firstChild !== requestHeading) return;
+      renderLoadError(heading, error.message, loadSpecialities);
+      dom.panel.lastChild.prepend(back);
+      return;
+    }
+    if (panelMode !== 'wizard' || dom.panel.firstChild !== requestHeading) return;
+    clear(dom.panel);
+    dom.panel.appendChild(h('h3', { text: heading }));
+    if (!choices.length) {
+      dom.panel.appendChild(h('p', { class: 'esh-note', text: 'ЕМИАС не показал специальностей для самостоятельной записи.' }));
+      dom.panel.appendChild(h('div', { class: 'esh-btns' }, [back]));
+      return;
+    }
+
+    const select = h('select', { id: 'esh-speciality', class: 'esh-speciality-select' }, [
+      h('option', { value: '', text: 'Выберите специальность' }),
+      ...choices.map(({ code, title }) => h('option', { value: code, text: title })),
+    ]);
+    const next = h('button', {
+      class: 'esh-btn primary', text: 'Продолжить в ЕМИАС', disabled: true,
+      onclick: () => {
+        const selected = choices.find(({ code }) => code === select.value);
+        if (selected) window.location.assign('/app/einfo/#/create?s=' + encodeURIComponent(selected.code));
+      },
+    });
+    select.addEventListener('change', () => { next.disabled = !select.value; });
+    dom.panel.appendChild(h('label', { class: 'esh-field', for: 'esh-speciality', text: 'Специальность' }));
+    dom.panel.appendChild(select);
+    dom.panel.appendChild(h('p', { class: 'esh-note', text: 'Цель визита, врача и время выберите на странице ЕМИАС.' }));
+    dom.panel.appendChild(h('div', { class: 'esh-btns' }, [back, next]));
   }
 
   /* ==================== шаг 2: условия для каждого выбранного пункта ==================== */

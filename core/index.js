@@ -272,6 +272,10 @@
     return {
       init,
       discover: () => discover.list(),
+      listSpecialities: async () => {
+        await init();
+        return discover.listSpecialities();
+      },
       setTargets: (list) => runner.setTargets(list.map(normalizeTarget)),
       dryRun: () => runner.dryRun(),
       confirmDryRun: (id) => runner.confirmDryRun(id),
