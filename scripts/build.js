@@ -5,7 +5,7 @@ const path = require('node:path');
 const ROOT = path.join(__dirname, '..');
 const ORDER = [
   'core/util.js', 'core/errors.js', 'core/filters.js', 'core/session.js',
-  'core/api.js', 'core/discover.js', 'core/targets.js', 'core/runner.js', 'core/index.js',
+  'core/api.js', 'core/discover.js', 'core/speciality.js', 'core/targets.js', 'core/runner.js', 'core/index.js',
   'userscript/ui-state.js', 'userscript/ui-dom.js',
 ];
 

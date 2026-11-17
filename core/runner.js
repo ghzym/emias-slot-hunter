@@ -31,6 +31,10 @@
   function gateFingerprint(list) {
     return hash(list.map((t) => {
       const { current, source, scenario, ...rest } = t;
+      if (scenario === 'bookSpeciality') {
+        const { ended, ...selection } = source || {};
+        return { ...rest, scenario, source: selection };
+      }
       return rest;
     }));
   }
@@ -58,12 +62,19 @@
     // Нижняя граница интервала — 20 секунд, чтобы не нагружать ЕМИАС, даже
     // если когда-нибудь захочется настроить более «быстрый» slowMs.
     const interval = () => Math.max(config.minIntervalMs, config.slowMs);
+    let revision = 0;
 
     function setTargets(list) {
+      revision++;
       state.list = list.map((t) => ({ ...t }));
       state.byId = {};
+      state.pending = {};
       state.verifyFailedKey = {};
-      for (const t of state.list) state.byId[t.id] = { state: 'idle', note: '' };
+      for (const t of state.list) {
+        state.byId[t.id] = t.scenario === 'bookSpeciality' && t.source?.ended
+          ? { state: 'done', note: t.source.ended }
+          : { state: 'idle', note: '' };
+      }
       // Смена целей обнуляет подтверждение холостого прогона — иначе можно
       // было бы подтвердить одни цели, а незаметно подставить другие.
       // lastReport тоже устаревает — иначе confirmDryRun() смог бы принять
@@ -72,8 +83,12 @@
       state.lastReport = null;
     }
 
-    async function appointments() {
+    async function appointments(requireList = false) {
       const r = await api.post('v10/saOrchestrator/getAppointmentReceptionsByPatient', {});
+      const body = r.json?.payload;
+      if (requireList && (!r.ok || !body || (body.appointment != null && !Array.isArray(body.appointment)))) {
+        throw new Error('ЕМИАС не отдал список записей. Повторите проверку позже.');
+      }
       return (r.json && r.json.payload && r.json.payload.appointment) || [];
     }
 
@@ -197,6 +212,7 @@
 
     async function start() {
       if (state.confirmed !== gateFingerprint(state.list)) throw new Error('сначала холостой прогон и подтверждение');
+      revision++;
       state.running = true;
       state.lastTickAt = now();
       state.lastCheckAt = 0; // в этом запуске проверок ещё не было
@@ -209,7 +225,9 @@
     }
 
     function stop() {
+      revision++;
       state.running = false;
+      state.pending = {};
       timer.cancel();
     }
 
@@ -229,12 +247,16 @@
     // выполненной и на этом же слоте не повторяемся прямо на следующем
     // тике; отказ (!ok) — смотрим action.
     async function finish(t, cand) {
-      const appts = await appointments();
-      const res = await targets.act(t, cand, { now: now(), appointments: appts });
+      const started = revision;
+      const active = () => state.running && revision === started;
+      const appts = await appointments(t.scenario === 'bookSpeciality');
+      if (!active()) return { ok: false, message: 'Поиск остановлен.' };
+      const res = await targets.act(t, cand, { now: now(), appointments: appts, active });
 
       if (res.ok && res.verified) {
         state.byId[t.id] = { state: t.keepImproving ? 'improving' : 'done', note: res.message };
         delete state.verifyFailedKey[t.id];
+        if (t.scenario === 'bookSpeciality') t.source = { ...t.source, ended: res.message };
         if (t.keepImproving && res.newAppointment) {
           t.current = res.newAppointment.startTime + '+03:00';
           const wasBookDoctor = t.scenario === 'bookDoctor';
@@ -268,6 +290,7 @@
           targetId: t.id, title: t.title, slot: cand.slot, address: cand.address, message: res.message,
           current: t.current, source: t.source, scenario: t.scenario,
         });
+        if (t.scenario === 'bookSpeciality') emit('targetDone', { targetId: t.id, title: t.title, message: res.message });
         return res;
       }
 
@@ -285,6 +308,10 @@
       // !res.ok — смотрим на action.
       if (res.action === 'stopTarget') {
         state.byId[t.id] = { state: 'stopped', note: res.message };
+        if (t.scenario === 'bookSpeciality') {
+          t.source = { ...t.source, ended: res.message };
+          emit('targetUpdated', { targetId: t.id, current: t.current, source: t.source, scenario: t.scenario });
+        }
         emit('targetDone', { targetId: t.id, title: t.title, message: res.message });
       } else if (res.action === 'relogin') {
         emit('sessionLost', { message: res.message });
@@ -304,7 +331,7 @@
       if (!state.running) return { ok: false, message: 'раннер остановлен, ответ не отправлен' };
       const p = state.pending[targetId];
       delete state.pending[targetId];
-      if (!p) return { ok: false, message: 'решение уже не актуально' };
+      if (!p || now() >= p.expiresAt) return { ok: false, message: 'решение уже не актуально' };
       if (decision !== 'book') {
         log(`${p.target.title}: пользователь отклонил слот`);
         return { ok: false };
@@ -314,6 +341,8 @@
 
     async function tick() {
       if (!state.running) return;
+      const started = revision;
+      const active = () => state.running && revision === started;
 
       // C2: гейт холостого прогона проверяем не только в start(), но и на
       // каждом тике — setTargets() может прийти уже во время работающего
@@ -351,6 +380,7 @@
             // targets.search() сам может нарваться на 429 ПОСЕРЕДИНЕ этого перебора
             // (например, у первой цели), и тогда без этой проверки раннер всё равно
             // продолжил бы дёргать ЕМИАС по остальным целям в том же тике.
+            if (!active()) return;
             if (now() < api.backoffUntil()) break targetsLoop;
             const st = state.byId[t.id];
             // 'improving' — цель уже выполнена один раз, но keepImproving
@@ -374,11 +404,16 @@
               continue;
             }
 
-            const r = await targets.search(t, { now: now(), appointments: appts });
+            const r = await targets.search(t, { now: now(), appointments: appts, active });
+            if (!active()) return;
 
             if (r.action === 'stopTarget') {
               const message = (r.notes && r.notes.join('; ')) || 'цель остановлена';
               state.byId[t.id] = { state: 'stopped', note: message };
+              if (t.scenario === 'bookSpeciality') {
+                t.source = { ...t.source, ended: message };
+                emit('targetUpdated', { targetId: t.id, current: t.current, source: t.source, scenario: t.scenario });
+              }
               // Та же реакция, что и на stopTarget из act() (см. finish()) —
               // кто следит только за событиями, должен узнать об остановке,
               // а не только по опросу status().
@@ -412,7 +447,10 @@
             if (t.mode === 'confirm') {
               const expiresAt = now() + 60000;
               state.pending[t.id] = { target: t, candidate: cand, expiresAt };
-              emit('needConfirm', { targetId: t.id, title: t.title, slot: cand.slot, address: cand.address, expiresAt });
+              emit('needConfirm', {
+                targetId: t.id, title: t.title, slot: cand.slot, address: cand.address, expiresAt,
+                ...(t.scenario === 'bookSpeciality' ? { name: cand.name, exactAddress: true } : {}),
+              });
               continue;
             }
 

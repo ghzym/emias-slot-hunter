@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ЕМИАС: охотник за слотами
 // @namespace    https://github.com/polinalamponi/emias-slot-hunter
-// @version      0.1.6
-// @description  Ищет слоты ЕМИАС по направлениям и записям. Открывает самостоятельную запись по выбранной специальности
+// @version      0.1.7
+// @description  Ищет слоты ЕМИАС по специальности, дате и отделению, а также по направлениям и существующим записям
 // @author       polinalamponi
 // @license      MIT
 // @homepageURL  https://github.com/polinalamponi/emias-slot-hunter
@@ -45,7 +45,7 @@ SOFTWARE.
 (function (root) {
   'use strict';
 
-  const VERSION = '0.1.6';
+  const VERSION = '0.1.7';
   const TZ = 'Europe/Moscow';
 
   function createUtil() {
@@ -400,7 +400,13 @@ SOFTWARE.
       return request('GET', path, undefined, retried);
     }
 
-    return { post, get, backoffUntil: () => backoffUntil, SessionError };
+    function getForPatient(path, params) {
+      const { oms, birth } = session.identity();
+      const query = new URLSearchParams({ ...params, omsNumber: oms, birthDate: birth });
+      return get(path + '?' + query.toString());
+    }
+
+    return { post, get, getForPatient, backoffUntil: () => backoffUntil, SessionError };
   }
 
   const api = { createApi, SessionError };
@@ -509,7 +515,7 @@ SOFTWARE.
       return out;
     }
 
-    async function listSpecialities() {
+    async function listSpecialities({ details = false } = {}) {
       const res = await api.post('v7/saOrchestrator/getSpecialitiesInfo', { isChatBotEnabled: false });
       if (!res.ok) {
         throw new Error(res.explained?.message || 'ЕМИАС не отдал список специальностей');
@@ -527,7 +533,21 @@ SOFTWARE.
         const code = codes.find((value) => !seen.has(value));
         for (const value of codes) seen.add(value);
         const title = typeof group?.title === 'string' ? group.title.trim() : '';
-        if (code && title && group.code !== 'pin') choices.push({ code, title });
+        if (!code || !title || group.code === 'pin') continue;
+        const choice = { code, title };
+        if (details) {
+          choice.group = group.code;
+          choice.members = group.specialities.filter((item) => codes.includes(String(item?.specialityCode)))
+            .map((item) => ({
+              code: String(item.specialityCode),
+              title: item.specialityName || title,
+              clinicSelection: item.ignoreAttachment === true,
+              multipleClinics: item.isMultipleLpuSpeciality === true,
+              paid: item.paid === true,
+              certificate: Array.isArray(item.certificates) && item.certificates.length > 0,
+            }));
+        }
+        choices.push(choice);
       }
       return choices.sort((a, b) => a.title.localeCompare(b.title, 'ru'));
     }
@@ -540,6 +560,257 @@ SOFTWARE.
   else { root.EmiasCore = root.EmiasCore || {}; Object.assign(root.EmiasCore, api); }
 })(typeof globalThis !== 'undefined' ? globalThis : this);
 
+/* ---- core/speciality.js ---- */
+(function (root) {
+  'use strict';
+
+  function createSpeciality({ api, util, filters, now, profileKey }) {
+    const id = (value) => {
+      const n = Number(value);
+      return Number.isSafeInteger(n) && n > 0 ? n : null;
+    };
+    const text = (value) => typeof value === 'string' ? value.trim() : '';
+    const addressKey = (value) => text(value).toLowerCase()
+      .replace(/^(?:г\.?\s+|город\s+)?москва[,\s]+/u, '')
+      .replace(/(^|[\s,])(?:улица|ул\.?)(?=\s)/gu, '$1ул')
+      .replace(/(^|[\s,])(?:дом|д\.?)(?=\s)/gu, '$1д')
+      .replace(/(^|[\s,])(?:корпус|корп\.?|к\.?)(?=\s)/gu, '$1к')
+      .replace(/\s*,\s*/g, ' ').replace(/\s+/g, ' ').trim();
+    const sameAddress = (a, b) => !!addressKey(a) && addressKey(a) === addressKey(b);
+    const items = (value) => Array.isArray(value) ? value : [];
+    const doctorName = (resource) => {
+      const doctor = resource.mainDoctor || {};
+      return [doctor.lastName, doctor.firstName, doctor.secondName].map(text).filter(Boolean).join(' ') || text(resource.name);
+    };
+    const payload = (r) => r.json?.payload;
+    const apptPath = 'v10/saOrchestrator/getAppointmentReceptionsByPatient';
+    const fail = (message, action = 'stopTarget') => ({ ok: false, verified: false, message, action });
+    const empty = (notes, action = null) => ({ candidates: [], rejected: [], notes, action });
+
+    async function purposes(group) {
+      const account = await profileKey();
+      if (!account) throw new Error('Откройте раздел «Записи» для нужного полиса и повторите.');
+      const patient = await api.post('v2/policy', { typeAttach: [0, 1, 2, 3], onlyMoscowPolicy: false });
+      if (!patient.ok || !payload(patient)?.patient) throw new Error('ЕМИАС не загрузил прикрепление по выбранному полису.');
+      const types = items(payload(patient).patient.attachments).map((a) => id(a?.lpu?.lpuType?.id)).filter(Boolean);
+      if (await profileKey() !== account) throw new Error('Выбран другой полис. Начните настройку заново.');
+      const response = await api.getForPatient('v7/inquiryPurpose/getInquiryPurpose', {
+        isMainPage: false, isReferral: false, lpuTypeId: [...new Set(types)].join(','),
+        specialityCode: group.members.map((member) => member.code).join(','),
+      });
+      if (!response.ok || !Array.isArray(payload(response))) throw new Error('ЕМИАС не отдал цели визита для этой специальности.');
+      if (await profileKey() !== account) throw new Error('Выбран другой полис. Начните настройку заново.');
+
+      const choices = [];
+      function add(purpose, inheritedForm, prefix) {
+        const title = text(purpose?.title) || text(purpose?.purposeName);
+        const label = prefix && title ? prefix + ' / ' + title : title || prefix;
+        const form = purpose?.receptionForm?.code || inheritedForm;
+        const nested = items(purpose?.purpose);
+        if (nested.length) {
+          nested.forEach((child) => add(child, form, label));
+          return;
+        }
+        const purposeId = id(purpose?.inquiryPurposeId);
+        const purposeCode = id(purpose?.inquiryPurposeCode);
+        if (!label || !purposeId || !purposeCode || form === 'telemedicine') return;
+        const allowed = items(purpose.groupMedicalSpeciality).flatMap((g) => items(g?.specialities))
+          .map((member) => id(member?.code)).filter(Boolean);
+        const lpuTypeIds = items(purpose.lpuTypeId).map(id).filter(Boolean);
+        choices.push({ id: purposeId, code: purposeCode, title: label, allowed, lpuTypeIds });
+      }
+      payload(response).forEach((p) => add(p, null, ''));
+      return { account, choices };
+    }
+
+    async function doctorList(source) {
+      const body = {
+        specialityId: source.codes, inquiryPurposeId: source.purpose.id, purposeReceptionForm: 'personal',
+      };
+      if (source.clinic) body.lpuId = source.clinic.id;
+      if (!source.dermatology && source.purpose.lpuTypeIds.length) body.lpuTypeId = source.purpose.lpuTypeIds;
+      return api.post('v5/saOrchestrator/getDoctorsInfo', body);
+    }
+
+    function rooms(result, source) {
+      const found = [];
+      for (const clinic of items(payload(result)?.doctorsInfo)) {
+        const clinicId = id(clinic?.lpuId);
+        if (!clinicId || (source.clinic && clinicId !== source.clinic.id)) continue;
+        for (const resource of items(clinic.availableResources)) {
+          const code = id(resource?.arSpecialityId || resource?.mainDoctor?.specialityId);
+          const resourceId = id(resource?.id);
+          if (!resourceId || !source.codes.includes(String(code)) || resource.available === false ||
+              resource.notAvailable || resource.availableByReferral || resource.isTmk) continue;
+          for (const cr of items(resource.complexResource)) {
+            const roomId = id(cr?.id);
+            const address = text(cr?.room?.defaultAddress);
+            if (!roomId || !address || (source.clinic && !sameAddress(address, source.clinic.address))) continue;
+            const title = text(cr.room.lpuShortName) || text(clinic.lpuShortName) || 'Отделение';
+            const reception = items(resource.receptionType).find((r) => String(r?.primary) === '1' && String(r?.home) === '0');
+            found.push({
+              clinic: { id: clinicId, title, address }, resourceId, roomId, code, name: doctorName(resource),
+              lpuId: id(resource.lpuId) || clinicId, receptionTypeId: id(reception?.code),
+            });
+          }
+        }
+      }
+      return found;
+    }
+
+    async function departments(group, purpose, account, selectedMember) {
+      if (await profileKey() !== account) throw new Error('Выбран другой полис. Начните настройку заново.');
+      const dermatology = group.group === 'dermatology';
+      const eligible = group.members.filter((m) => !m.paid && !m.certificate);
+      const members = dermatology ? eligible.filter((m) => m.code === selectedMember)
+        : eligible.filter((m) => !purpose.allowed.length || purpose.allowed.includes(id(m.code)));
+      const codes = [...new Set(members.map((m) => m.code))];
+      const source = { account, codes, purpose, dermatology };
+      if (!codes.length) return { source, clinics: [] };
+      if (!dermatology && members.some((m) => m.multipleClinics)) {
+        throw new Error('Для этой специальности ЕМИАС открывает отдельную форму записи.');
+      }
+      let clinics;
+      if (dermatology && members[0].clinicSelection) {
+        const result = await api.post('v4/saOrchestrator/getLpusForSpeciality', { specialityCode: codes[0] });
+        if (!result.ok || !Array.isArray(payload(result)?.lpu)) throw new Error('ЕМИАС не отдал список филиалов.');
+        clinics = payload(result).lpu.flatMap((clinic) => {
+          const clinicId = id(clinic?.id);
+          if (!clinicId) return [];
+          return items(clinic.address).map((a) => ({
+            id: clinicId, title: text(clinic.shortName) || text(clinic.name) || 'Отделение', address: text(a?.addressString),
+          })).filter((a) => a.address);
+        });
+      } else {
+        const result = await doctorList(source);
+        if (!result.ok || !Array.isArray(payload(result)?.doctorsInfo)) throw new Error('ЕМИАС не отдал список отделений.');
+        const listed = payload(result).doctorsInfo.map((d) => ({
+          id: id(d?.lpuId), title: text(d?.lpuShortName) || 'Отделение', address: text(d?.defaultAddress),
+        })).filter((d) => d.id && d.address);
+        clinics = [...listed, ...rooms(result, source).map((r) => r.clinic)];
+      }
+      if (await profileKey() !== account) throw new Error('Выбран другой полис. Начните настройку заново.');
+      const unique = new Map(clinics.map((c) => [String(c.id) + '|' + addressKey(c.address), c]));
+      return { source, clinics: [...unique.values()].sort((a, b) => (a.title + a.address).localeCompare(b.title + b.address, 'ru')) };
+    }
+
+    const dayOf = (startTime) => Number.isFinite(util.toMs(startTime)) ? util.mskDate(new Date(util.toMs(startTime))) : null;
+    const sameSpeciality = (s, appointment) => s.codes.includes(String(id(appointment?.toDoctor?.specialityId)));
+    function appointmentMatches(t, a, c = null) {
+      const clinicId = id(a?.lpuId);
+      return sameSpeciality(t.source, a) && dayOf(a.startTime) === t.onlyDay &&
+        (!clinicId || clinicId === t.source.clinic.id || clinicId === c?.lpuId) &&
+        sameAddress(a.lpuAddress, t.source.clinic.address) && (!c || util.toMs(a.startTime) === util.toMs(c.slot.startTime));
+    }
+
+    async function search(t, ctx) {
+      const s = t.source;
+      const day = t.onlyDay;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(day || '') || dayOf(day + 'T12:00:00') !== day ||
+          !s?.clinic?.id || !s.clinic.address || !s.codes?.length || !s.purpose?.id) {
+        return empty(['Выберите специальность, отделение и дату заново.'], 'stopTarget');
+      }
+      if (day < util.mskDate(new Date(ctx.now))) return empty(['Выбранная дата уже прошла.'], 'stopTarget');
+      if (await profileKey() !== s.account) return empty(['Выбран другой полис. Откройте «Настроить» для нужного полиса.'], 'stopTarget');
+      if (ctx.appointments.some((a) => appointmentMatches(t, a))) {
+        return empty(['Запись на выбранную дату в этом отделении уже есть.'], 'stopTarget');
+      }
+      const resources = await doctorList(s);
+      if (!resources.ok) return empty([resources.explained?.message || 'ЕМИАС не отдал список врачей.'], resources.explained?.action);
+      const candidates = [];
+      const notes = [];
+      let rejected = [];
+      let action = null;
+      const available = rooms(resources, s);
+      const visited = new Set();
+      for (const r of available) {
+        if (now() < api.backoffUntil() || ctx.active?.() === false) break;
+        const key = r.resourceId + '|' + r.roomId;
+        if (visited.has(key)) continue;
+        visited.add(key);
+        const schedule = await api.post('v4/saOrchestrator/getAvailableResourceScheduleInfo', {
+          availableResourceId: r.resourceId, complexResourceId: r.roomId, inquiryPurposeId: s.purpose.id,
+          period: { dateFrom: day, dateTo: day },
+        });
+        if (!schedule.ok) {
+          const msg = schedule.explained?.message || 'ЕМИАС не отдал расписание.';
+          if (!notes.includes(msg)) notes.push(msg);
+          action = schedule.explained?.action || action;
+          continue;
+        }
+        const info = payload(schedule);
+        if (id(info?.availableResource?.id) && id(info.availableResource.id) !== r.resourceId) continue;
+        const room = items(info?.availableResource?.complexResource).find((c) => id(c?.id) === r.roomId);
+        if (!sameAddress(room?.room?.defaultAddress, s.clinic.address)) continue;
+        const slots = items(info?.scheduleOfDay).flatMap((d) => items(d?.scheduleBySlot))
+          .filter((b) => b?.complexResourceId == null || id(b.complexResourceId) === r.roomId)
+          .flatMap((b) => items(b?.slot)).filter((slot) => dayOf(slot?.startTime) === day &&
+            util.toMs(slot.startTime) >= ctx.now && util.toMs(slot.endTime) > util.toMs(slot.startTime) &&
+            slot.available !== false && !slot.notAvailable && !slot.disabled);
+        const picked = filters.pickSlots({
+          slots, target: t, now: ctx.now, appointments: ctx.appointments, addressOf: () => s.clinic.address,
+        });
+        if (picked.skipped && !notes.includes(picked.skipped)) notes.push(picked.skipped);
+        rejected = rejected.concat(picked.rejected);
+        for (const slot of picked.ok) candidates.push({ ...r, complexResourceId: r.roomId, slot, address: s.clinic.address });
+      }
+      candidates.sort((a, b) => util.toMs(a.slot.startTime) - util.toMs(b.slot.startTime));
+      if (!available.length) notes.push('ЕМИАС пока не показывает врачей в выбранном отделении.');
+      return { candidates, rejected, notes, action };
+    }
+
+    async function book(t, cand, ctx) {
+      const s = t.source;
+      if (!s?.clinic || !s.codes?.includes(String(cand.code)) || dayOf(cand.slot.startTime) !== t.onlyDay ||
+          cand.clinic.id !== s.clinic.id || !sameAddress(cand.address, s.clinic.address) ||
+          util.toMs(cand.slot.startTime) <= now()) return fail('Слот больше не соответствует выбранным условиям.', 'retry');
+      if (ctx.active?.() === false) return fail('Поиск остановлен.', null);
+      if (await profileKey() !== s.account) return fail('Выбран другой полис. Начните поиск заново.');
+      if (ctx.appointments.some((a) => appointmentMatches(t, a))) return fail('Запись на выбранную дату в этом отделении уже есть.');
+      const check = await api.post('v6/chatBot/check', {
+        inquiryPurposeId: s.purpose.id, specialityId: cand.code, lpuId: cand.lpuId,
+      });
+      const rules = payload(check);
+      if (!check.ok || !rules || typeof rules !== 'object' || Array.isArray(rules)) {
+        return fail(check.explained?.message || 'ЕМИАС не подтвердил условия записи.', check.explained?.action || 'retry');
+      }
+      if (rules.inquiryPurposeBlock) {
+        const when = cand.slot.startTime.slice(0, 16).replace('T', ' ');
+        return fail('Найдено время ' + when + ' по адресу ' + cand.address + '. Для записи ЕМИАС просит пройти опрос на сайте.');
+      }
+      if (await profileKey() !== s.account) return fail('Выбран другой полис. Начните поиск заново.');
+      if (ctx.active?.() === false) return fail('Поиск остановлен.', null);
+      if (util.toMs(cand.slot.startTime) <= now()) return fail('Время приёма уже прошло.', 'retry');
+      const body = {
+        availableResourceId: cand.resourceId, complexResourceId: cand.roomId,
+        startTime: cand.slot.startTime, endTime: cand.slot.endTime,
+        inquiryPurposeId: s.purpose.id, inquiryPurposeCode: s.purpose.code,
+      };
+      if (cand.receptionTypeId) body.receptionTypeId = cand.receptionTypeId;
+      if (rules.complaint?.id) body.complaintId = rules.complaint.id;
+      const response = await api.post('v4/saOrchestrator/createAppointment', body, true);
+      if (!response.ok && response.status > 0 && response.status < 500) {
+        const action = response.status === 409 || response.status === 429 ? 'retry' : 'stopTarget';
+        return fail(response.explained?.message || 'ЕМИАС не принял запись.', action);
+      }
+      const appointmentId = id(payload(response)?.appointmentId);
+      const before = new Set(ctx.appointments.map((a) => id(a.id)));
+      let records;
+      try { records = await api.post(apptPath, {}); } catch { records = null; }
+      const appointment = items(records?.ok && payload(records)?.appointment).find((a) =>
+        !before.has(id(a.id)) && (!appointmentId || appointmentId === id(a.id)) && appointmentMatches(t, a, cand));
+      if (appointment) return { ok: true, verified: true, newAppointment: appointment, message: 'ЕМИАС подтвердил запись.' };
+      return fail('ЕМИАС не подтвердил запись в списке приёмов. Проверьте раздел «Записи» перед повтором.');
+    }
+
+    return { purposes, departments, search, book };
+  }
+
+  const api = { createSpeciality };
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  else { root.EmiasCore = root.EmiasCore || {}; Object.assign(root.EmiasCore, api); }
+})(typeof globalThis !== 'undefined' ? globalThis : this);
+
 /* ---- core/targets.js ---- */
 // core/targets.js — новая запись по направлению: на анализ крови (bookLab), к врачу
 // (bookDoctor), на исследование (bookLdp) — и перенос существующих записей
@@ -547,7 +818,7 @@ SOFTWARE.
 (function (root) {
   'use strict';
 
-  function createTargets({ api, filters, util }) {
+  function createTargets({ api, filters, util, speciality }) {
     const { toMs, campus } = util;
 
     // Поддерживаются только эти сценарии. Всё остальное (например,
@@ -643,6 +914,7 @@ SOFTWARE.
     }
 
     async function search(t, ctx) {
+      if (t.scenario === 'bookSpeciality' && speciality) return speciality.search(t, ctx);
       if (!SUPPORTED_SCENARIOS.has(t.scenario)) {
         return { candidates: [], rejected: [], notes: [UNSUPPORTED_MESSAGE], action: null };
       }
@@ -780,6 +1052,7 @@ SOFTWARE.
     }
 
     async function act(t, cand, ctx) {
+      if (t.scenario === 'bookSpeciality' && speciality) return speciality.book(t, cand, ctx);
       const base = {
         availableResourceId: cand.resourceId, complexResourceId: cand.complexResourceId,
         startTime: cand.slot.startTime, endTime: cand.slot.endTime,
@@ -898,6 +1171,10 @@ SOFTWARE.
   function gateFingerprint(list) {
     return hash(list.map((t) => {
       const { current, source, scenario, ...rest } = t;
+      if (scenario === 'bookSpeciality') {
+        const { ended, ...selection } = source || {};
+        return { ...rest, scenario, source: selection };
+      }
       return rest;
     }));
   }
@@ -925,12 +1202,19 @@ SOFTWARE.
     // Нижняя граница интервала — 20 секунд, чтобы не нагружать ЕМИАС, даже
     // если когда-нибудь захочется настроить более «быстрый» slowMs.
     const interval = () => Math.max(config.minIntervalMs, config.slowMs);
+    let revision = 0;
 
     function setTargets(list) {
+      revision++;
       state.list = list.map((t) => ({ ...t }));
       state.byId = {};
+      state.pending = {};
       state.verifyFailedKey = {};
-      for (const t of state.list) state.byId[t.id] = { state: 'idle', note: '' };
+      for (const t of state.list) {
+        state.byId[t.id] = t.scenario === 'bookSpeciality' && t.source?.ended
+          ? { state: 'done', note: t.source.ended }
+          : { state: 'idle', note: '' };
+      }
       // Смена целей обнуляет подтверждение холостого прогона — иначе можно
       // было бы подтвердить одни цели, а незаметно подставить другие.
       // lastReport тоже устаревает — иначе confirmDryRun() смог бы принять
@@ -939,8 +1223,12 @@ SOFTWARE.
       state.lastReport = null;
     }
 
-    async function appointments() {
+    async function appointments(requireList = false) {
       const r = await api.post('v10/saOrchestrator/getAppointmentReceptionsByPatient', {});
+      const body = r.json?.payload;
+      if (requireList && (!r.ok || !body || (body.appointment != null && !Array.isArray(body.appointment)))) {
+        throw new Error('ЕМИАС не отдал список записей. Повторите проверку позже.');
+      }
       return (r.json && r.json.payload && r.json.payload.appointment) || [];
     }
 
@@ -1064,6 +1352,7 @@ SOFTWARE.
 
     async function start() {
       if (state.confirmed !== gateFingerprint(state.list)) throw new Error('сначала холостой прогон и подтверждение');
+      revision++;
       state.running = true;
       state.lastTickAt = now();
       state.lastCheckAt = 0; // в этом запуске проверок ещё не было
@@ -1076,7 +1365,9 @@ SOFTWARE.
     }
 
     function stop() {
+      revision++;
       state.running = false;
+      state.pending = {};
       timer.cancel();
     }
 
@@ -1096,12 +1387,16 @@ SOFTWARE.
     // выполненной и на этом же слоте не повторяемся прямо на следующем
     // тике; отказ (!ok) — смотрим action.
     async function finish(t, cand) {
-      const appts = await appointments();
-      const res = await targets.act(t, cand, { now: now(), appointments: appts });
+      const started = revision;
+      const active = () => state.running && revision === started;
+      const appts = await appointments(t.scenario === 'bookSpeciality');
+      if (!active()) return { ok: false, message: 'Поиск остановлен.' };
+      const res = await targets.act(t, cand, { now: now(), appointments: appts, active });
 
       if (res.ok && res.verified) {
         state.byId[t.id] = { state: t.keepImproving ? 'improving' : 'done', note: res.message };
         delete state.verifyFailedKey[t.id];
+        if (t.scenario === 'bookSpeciality') t.source = { ...t.source, ended: res.message };
         if (t.keepImproving && res.newAppointment) {
           t.current = res.newAppointment.startTime + '+03:00';
           const wasBookDoctor = t.scenario === 'bookDoctor';
@@ -1135,6 +1430,7 @@ SOFTWARE.
           targetId: t.id, title: t.title, slot: cand.slot, address: cand.address, message: res.message,
           current: t.current, source: t.source, scenario: t.scenario,
         });
+        if (t.scenario === 'bookSpeciality') emit('targetDone', { targetId: t.id, title: t.title, message: res.message });
         return res;
       }
 
@@ -1152,6 +1448,10 @@ SOFTWARE.
       // !res.ok — смотрим на action.
       if (res.action === 'stopTarget') {
         state.byId[t.id] = { state: 'stopped', note: res.message };
+        if (t.scenario === 'bookSpeciality') {
+          t.source = { ...t.source, ended: res.message };
+          emit('targetUpdated', { targetId: t.id, current: t.current, source: t.source, scenario: t.scenario });
+        }
         emit('targetDone', { targetId: t.id, title: t.title, message: res.message });
       } else if (res.action === 'relogin') {
         emit('sessionLost', { message: res.message });
@@ -1171,7 +1471,7 @@ SOFTWARE.
       if (!state.running) return { ok: false, message: 'раннер остановлен, ответ не отправлен' };
       const p = state.pending[targetId];
       delete state.pending[targetId];
-      if (!p) return { ok: false, message: 'решение уже не актуально' };
+      if (!p || now() >= p.expiresAt) return { ok: false, message: 'решение уже не актуально' };
       if (decision !== 'book') {
         log(`${p.target.title}: пользователь отклонил слот`);
         return { ok: false };
@@ -1181,6 +1481,8 @@ SOFTWARE.
 
     async function tick() {
       if (!state.running) return;
+      const started = revision;
+      const active = () => state.running && revision === started;
 
       // C2: гейт холостого прогона проверяем не только в start(), но и на
       // каждом тике — setTargets() может прийти уже во время работающего
@@ -1218,6 +1520,7 @@ SOFTWARE.
             // targets.search() сам может нарваться на 429 ПОСЕРЕДИНЕ этого перебора
             // (например, у первой цели), и тогда без этой проверки раннер всё равно
             // продолжил бы дёргать ЕМИАС по остальным целям в том же тике.
+            if (!active()) return;
             if (now() < api.backoffUntil()) break targetsLoop;
             const st = state.byId[t.id];
             // 'improving' — цель уже выполнена один раз, но keepImproving
@@ -1241,11 +1544,16 @@ SOFTWARE.
               continue;
             }
 
-            const r = await targets.search(t, { now: now(), appointments: appts });
+            const r = await targets.search(t, { now: now(), appointments: appts, active });
+            if (!active()) return;
 
             if (r.action === 'stopTarget') {
               const message = (r.notes && r.notes.join('; ')) || 'цель остановлена';
               state.byId[t.id] = { state: 'stopped', note: message };
+              if (t.scenario === 'bookSpeciality') {
+                t.source = { ...t.source, ended: message };
+                emit('targetUpdated', { targetId: t.id, current: t.current, source: t.source, scenario: t.scenario });
+              }
               // Та же реакция, что и на stopTarget из act() (см. finish()) —
               // кто следит только за событиями, должен узнать об остановке,
               // а не только по опросу status().
@@ -1279,7 +1587,10 @@ SOFTWARE.
             if (t.mode === 'confirm') {
               const expiresAt = now() + 60000;
               state.pending[t.id] = { target: t, candidate: cand, expiresAt };
-              emit('needConfirm', { targetId: t.id, title: t.title, slot: cand.slot, address: cand.address, expiresAt });
+              emit('needConfirm', {
+                targetId: t.id, title: t.title, slot: cand.slot, address: cand.address, expiresAt,
+                ...(t.scenario === 'bookSpeciality' ? { name: cand.name, exactAddress: true } : {}),
+              });
               continue;
             }
 
@@ -1463,7 +1774,8 @@ SOFTWARE.
     const session = M.createSession({ storage, fetch, now });
     const api = M.createApi({ session, errors, fetch, now });
     const discover = M.createDiscover({ api, today: () => util.mskDate(new Date(now())) });
-    const targets = M.createTargets({ api, filters, util });
+    const speciality = M.createSpeciality?.({ api, filters, util, now, profileKey: specialityProfileKey });
+    const targets = M.createTargets({ api, filters, util, speciality });
 
     // Простая шина событий: подписка по типу события ('log', 'found',
     // 'booked', 'needConfirm', 'sessionLost', 'stale', 'slept', 'standby', ...)
@@ -1574,9 +1886,26 @@ SOFTWARE.
     // вызывающий код попросит ввести их. Ошибка сессии (SessionError из
     // api.get) наоборот НЕ гасится — это не «не нашли данные», а настоящая
     // потеря входа, и она должна дойти до вызывающего кода как есть.
+    function selectedPolicy() {
+      try { return JSON.parse(JSON.parse(storage.getItem('persist:persist')).persistOmsNumber); } catch { return null; }
+    }
+
+    async function specialityProfileKey() {
+      const oms = selectedPolicy();
+      if (!oms || !siteLoggedIn() || session.identity().oms !== oms) return null;
+      const key = 'emiasSlotHunter:profileSalt';
+      let salt = storage.getItem(key);
+      if (!salt) {
+        salt = crypto.randomUUID();
+        storage.setItem(key, salt);
+      }
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(salt + ':' + oms));
+      if (selectedPolicy() !== oms || !siteLoggedIn() || session.identity().oms !== oms) return null;
+      return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+    }
+
     async function identityFromStorage() {
-      let oms = null;
-      try { oms = JSON.parse(JSON.parse(storage.getItem('persist:persist')).persistOmsNumber); } catch (e) { oms = null; }
+      const oms = selectedPolicy();
       let birth = null;
       try {
         const t = JSON.parse(JSON.parse(storage.getItem('persist:sessionAuth')).idToken);
@@ -1613,7 +1942,7 @@ SOFTWARE.
     // поддержан целиком (см. targets.js), «улучшать» там нечего. Явное
     // keepImproving: false в цели отключает поведение.
     function normalizeTarget(t) {
-      return { ...t, keepImproving: t.keepImproving !== false && t.scenario !== 'bookReferral' };
+      return { ...t, keepImproving: t.keepImproving !== false && !['bookReferral', 'bookSpeciality'].includes(t.scenario) };
     }
 
     return {
@@ -1621,8 +1950,11 @@ SOFTWARE.
       discover: () => discover.list(),
       listSpecialities: async () => {
         await init();
-        return discover.listSpecialities();
+        return discover.listSpecialities({ details: true });
       },
+      specialityPurposes: (group) => speciality.purposes(group),
+      specialityDepartments: (group, purpose, account, member) => speciality.departments(group, purpose, account, member),
+      today: () => util.mskDate(new Date(now())),
       setTargets: (list) => runner.setTargets(list.map(normalizeTarget)),
       dryRun: () => runner.dryRun(),
       confirmDryRun: (id) => runner.confirmDryRun(id),
@@ -1678,6 +2010,7 @@ SOFTWARE.
     const dayHuman = (ymd) => { const d = String(ymd).split('-'); return `${Number(d[2])} ${MONTHS[Number(d[1]) - 1]}`; };
 
     function buildTarget(option, form) {
+      const speciality = option.scenario === 'bookSpeciality';
       // form.when — три взаимоисключающих варианта:
       //  - 'earlier': раньше текущей записи, день любой (onlyDay=null, anyTime=false);
       //  - 'sameDayEarlier': в тот же день, что текущая запись, но раньше неё
@@ -1710,14 +2043,14 @@ SOFTWARE.
         deadline,
         timeFrom: form.timeFrom || null,
         timeTo: form.timeTo || null,
-        addressContains: form.where === 'sameCampus' ? stripCampus(option.address)
+        addressContains: speciality ? null : form.where === 'sameCampus' ? stripCampus(option.address)
           : form.where === 'contains' ? (form.addressContains || null) : null,
         prefer: form.preferUntil ? { until: form.preferUntil, timeTo: form.preferTimeTo || null } : null,
         near: form.nearStart && form.nearEnd ? { start: form.nearStart, end: form.nearEnd } : null,
         respectTravel: form.respectTravel !== false,
         travelMs: 60 * 60000,
-        minLeadMs: 2 * 60 * 60000,
-        keepImproving: option.scenario !== 'bookReferral',
+        minLeadMs: speciality ? 0 : 2 * 60 * 60000,
+        keepImproving: !speciality && option.scenario !== 'bookReferral',
         mode: form.mode === 'confirm' ? 'confirm' : 'auto',
         purpose: (option.source && option.source.needPurpose) ? (() => {
           const chosen = INQUIRY_PURPOSES[form.purpose === 'documents' ? 'documents' : 'unwell'];
@@ -1733,6 +2066,9 @@ SOFTWARE.
 
     function describeTarget(t) {
       const parts = [];
+      if (t.scenario === 'bookSpeciality') {
+        parts.push(t.source.clinic.title + ' — ' + t.source.clinic.address, t.source.purpose.title);
+      }
       if (t.near) parts.push(`подгоняю ближе к ${human(t.near.start)}–${String(t.near.end).slice(11, 16)}`);
       else if (t.onlyDay && t.anyTime) parts.push(`любое время ${dayHuman(t.onlyDay)}`);
       else if (t.onlyDay && t.current) parts.push(`${dayHuman(t.onlyDay)}, раньше ${human(t.current)}`);
@@ -1775,9 +2111,9 @@ SOFTWARE.
     }
 
     function describeDryRunItem(item) {
-      const head = item.waiting
-        ? `${item.title}: подходящих слотов сейчас нет, жду`
-        : `${item.title}: взяла бы ${human(item.would.startTime)} — ${item.would.address}`;
+      let head = item.title;
+      if (item.would) head += `: взяла бы ${human(item.would.startTime)} — ${item.would.address}`;
+      else if (item.waiting) head += ': подходящих слотов сейчас нет, жду';
       const warn = (item.warnings || []).map((w) => `\n  ⚠ ${w}`).join('');
       const notes = (item.notes || []).map((n) => `\n  · ${n}`).join('');
       return head + warn + notes;
@@ -2028,7 +2364,7 @@ SOFTWARE.
       .esh-badge.k-booked { background: #e08a2b; }
       .esh-badge.k-standby { background: #3a7bd5; }
       .esh-badge.k-paused { background: #8a6d3b; }
-      .esh-badge.k-needLogin, .esh-badge.k-needIdentity, .esh-badge.k-sessionLost, .esh-badge.k-stale, .esh-badge.k-resumeError, .esh-badge.k-needDryRun { background: #d64545; }
+      .esh-badge.k-needLogin, .esh-badge.k-needIdentity, .esh-badge.k-sessionLost, .esh-badge.k-stale, .esh-badge.k-resumeError, .esh-badge.k-needDryRun, .esh-badge.k-stopped { background: #d64545; }
       .esh-sub { display: block; font-size: 11px; opacity: .85; font-weight: normal; }
       .esh-card { width: 320px; max-width: calc(100vw - 32px); box-sizing: border-box; max-height: 70vh; overflow: auto; background: #fff; color: #222; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,.3); padding: 14px; }
       .esh-card h3 { margin: 0 0 8px; font-size: 16px; }
@@ -2113,6 +2449,7 @@ SOFTWARE.
     if (kind === 'resumeError') { resumeIfEnabled(); return; }
     if (kind === 'standby') { openStandbyPanel(); return; }
     if (kind === 'booked') { acknowledgeBooked(); openStatusPanel(); return; }
+    if (kind === 'stopped') { openStatusPanel(); return; }
     if (kind === 'running' || kind === 'resuming') { openStatusPanel(); return; }
     // needDryRun и любой прочий случай — безопаснее всего начать настройку заново.
     openWizardGuarded(1);
@@ -2265,7 +2602,9 @@ SOFTWARE.
     const logBox = renderLog(logEvents);
     dom.panel.appendChild(logBox);
     logBox.scrollTop = logScrollTop;
-    const stopBtn = h('button', { class: 'esh-btn danger', text: 'Остановить поиск', onclick: onStop });
+    const stopBtn = st.running
+      ? h('button', { class: 'esh-btn danger', text: 'Остановить поиск', onclick: onStop })
+      : h('button', { class: 'esh-btn', text: 'Настроить', onclick: () => openWizardGuarded(1) });
     dom.panel.appendChild(h('div', { class: 'esh-btns' }, [stopBtn]));
   }
 
@@ -2353,6 +2692,7 @@ SOFTWARE.
   }
 
   function describeOptionMeta(option) {
+    if (option.scenario === 'bookSpeciality') return option.source.clinic.title + ' — ' + option.address;
     const parts = [];
     if (option.current) parts.push('сейчас записано на ' + ui.human(option.current));
     if (option.address) parts.push(ui.stripCampus(option.address));
@@ -2364,7 +2704,7 @@ SOFTWARE.
     clear(dom.panel);
     dom.panel.appendChild(h('h3', { text: 'Шаг 1 из 3. За чем следить' }));
     dom.panel.appendChild(h('div', { class: 'esh-btns' }, [
-      h('button', { class: 'esh-btn', text: 'Записаться по специальности', onclick: loadSpecialities }),
+      h('button', { class: 'esh-btn', text: 'Найти слот по специальности', onclick: loadSpecialities }),
     ]));
     if (!options.length) {
       dom.panel.appendChild(h('p', { class: 'esh-note', text: 'Направлений и записей, с которыми можно работать, не найдено.' }));
@@ -2379,46 +2719,92 @@ SOFTWARE.
     dom.panel.appendChild(h('div', { class: 'esh-btns' }, [next]));
   }
 
-  async function loadSpecialities() {
-    const heading = 'Запись по специальности';
-    const back = h('button', { class: 'esh-btn', text: 'Назад', onclick: backToStep1 });
+  async function loadSpecialityScreen(heading, request, render, onBack) {
+    const back = h('button', { class: 'esh-btn', text: 'Назад', onclick: onBack });
     renderLoading(heading);
     const requestHeading = dom.panel.firstChild;
     dom.panel.appendChild(h('div', { class: 'esh-btns' }, [back]));
-    let choices;
+    const active = () => panelMode === 'wizard' && dom.panel.firstChild === requestHeading;
+    let data;
     try {
-      choices = await core.listSpecialities();
+      data = await request();
     } catch (error) {
-      if (panelMode !== 'wizard' || dom.panel.firstChild !== requestHeading) return;
-      renderLoadError(heading, error.message, loadSpecialities);
+      if (!active()) return;
+      renderLoadError(heading, error.message, () => loadSpecialityScreen(heading, request, render, onBack));
       dom.panel.lastChild.prepend(back);
       return;
     }
-    if (panelMode !== 'wizard' || dom.panel.firstChild !== requestHeading) return;
+    if (active()) render(data);
+  }
+
+  function renderSpecialityChoice(heading, label, choices, onSelect, onBack, emptyText) {
+    const back = h('button', { class: 'esh-btn', text: 'Назад', onclick: onBack });
     clear(dom.panel);
     dom.panel.appendChild(h('h3', { text: heading }));
     if (!choices.length) {
-      dom.panel.appendChild(h('p', { class: 'esh-note', text: 'ЕМИАС не показал специальностей для самостоятельной записи.' }));
+      dom.panel.appendChild(h('p', { class: 'esh-note', text: emptyText }));
       dom.panel.appendChild(h('div', { class: 'esh-btns' }, [back]));
       return;
     }
 
-    const select = h('select', { id: 'esh-speciality', class: 'esh-speciality-select' }, [
-      h('option', { value: '', text: 'Выберите специальность' }),
-      ...choices.map(({ code, title }) => h('option', { value: code, text: title })),
+    const select = h('select', { id: 'esh-speciality-choice', class: 'esh-speciality-select' }, [
+      h('option', { value: '', text: 'Выберите из списка' }),
+      ...choices.map((choice, index) => h('option', { value: String(index), text: choice.title })),
     ]);
     const next = h('button', {
-      class: 'esh-btn primary', text: 'Продолжить в ЕМИАС', disabled: true,
+      class: 'esh-btn primary', text: 'Далее', disabled: true,
       onclick: () => {
-        const selected = choices.find(({ code }) => code === select.value);
-        if (selected) window.location.assign('/app/einfo/#/create?s=' + encodeURIComponent(selected.code));
+        if (select.value !== '') onSelect(choices[Number(select.value)]);
       },
     });
+    if (choices.length === 1) { select.value = '0'; next.disabled = false; }
     select.addEventListener('change', () => { next.disabled = !select.value; });
-    dom.panel.appendChild(h('label', { class: 'esh-field', for: 'esh-speciality', text: 'Специальность' }));
+    dom.panel.appendChild(h('label', { class: 'esh-field', for: 'esh-speciality-choice', text: label }));
     dom.panel.appendChild(select);
-    dom.panel.appendChild(h('p', { class: 'esh-note', text: 'Цель визита, врача и время выберите на странице ЕМИАС.' }));
     dom.panel.appendChild(h('div', { class: 'esh-btns' }, [back, next]));
+  }
+
+  function loadSpecialities() {
+    const heading = 'Поиск слота по специальности';
+    loadSpecialityScreen(heading, () => core.listSpecialities(), (groups) => {
+      renderSpecialityChoice(heading, 'Специальность', groups, loadSpecialityPurposes, backToStep1,
+        'ЕМИАС не показал специальностей для самостоятельной записи.');
+    }, backToStep1);
+  }
+
+  function loadSpecialityPurposes(group) {
+    loadSpecialityScreen(group.title, () => core.specialityPurposes(group), ({ account, choices }) => {
+      renderSpecialityChoice(group.title, 'Цель визита', choices, (purpose) => {
+        const back = () => loadSpecialityPurposes(group);
+        if (group.group !== 'dermatology') {
+          loadSpecialityDepartments(group, purpose, account, null, back);
+          return;
+        }
+        const members = group.members.filter((m) => !m.paid && !m.certificate &&
+          (window.EINFO_CONFIG?.APP_TOGGLE_VENEROLOGY_OPENED === true || !/(^|[^а-яё])венеролог/iu.test(m.title)));
+        const showMembers = () => renderSpecialityChoice(group.title, 'Вариант приёма', members,
+          (member) => loadSpecialityDepartments(group, purpose, account, member, showMembers), back,
+          'ЕМИАС не показал доступных вариантов очного приёма.');
+        showMembers();
+      }, loadSpecialities, 'ЕМИАС не показал доступных целей для очного приёма.');
+    }, loadSpecialities);
+  }
+
+  function loadSpecialityDepartments(group, purpose, account, member, back) {
+    const title = member && member.title !== group.title ? member.title : group.title;
+    loadSpecialityScreen(title, () => core.specialityDepartments(group, purpose, account, member?.code), (result) => {
+      const choices = result.clinics.map((clinic) => ({ title: clinic.title + ' — ' + clinic.address, clinic }));
+      renderSpecialityChoice(title, 'Отделение', choices, ({ clinic }) => {
+        const id = ['speciality', group.code, member?.code || '', purpose.id, clinic.id, clinic.address].join('|');
+        const option = {
+          id, title, scenario: 'bookSpeciality', address: clinic.address,
+          source: { ...result.source, clinic },
+        };
+        wizard.options = [...wizard.options.filter((o) => o.id !== id), option];
+        toggleOption(option, true);
+        openWizard(2);
+      }, back, 'ЕМИАС пока не показывает отделений для выбранной цели визита.');
+    }, back);
   }
 
   /* ==================== шаг 2: условия для каждого выбранного пункта ==================== */
@@ -2426,10 +2812,11 @@ SOFTWARE.
     if (!wizard.forms[option.id]) {
       wizard.forms[option.id] = {
         // Для новой записи 'earlier' показывается как «как можно раньше».
-        when: 'earlier',
+        when: option.scenario === 'bookSpeciality' ? 'onlyDay' : 'earlier',
         day: '', dateFrom: '', dateTo: '', timeFrom: '', timeTo: '',
         where: option.address ? 'sameCampus' : 'any', addressContains: '',
-        respectTravel: true, mode: 'auto', purpose: 'unwell',
+        respectTravel: option.scenario !== 'bookSpeciality',
+        mode: option.scenario === 'bookSpeciality' ? 'confirm' : 'auto', purpose: 'unwell',
       };
     }
     return wizard.forms[option.id];
@@ -2508,11 +2895,22 @@ SOFTWARE.
     // год с клавиатуры было не набрать. Обновляем только ошибку и «Далее».
     const quiet = (patch) => { Object.assign(form, patch); refreshStepTwoState(); };
     const card = h('div', { class: 'esh-opt' });
+    const speciality = option.scenario === 'bookSpeciality';
     card.appendChild(h('div', { class: 'title', text: option.title }));
-    card.appendChild(h('label', { class: 'esh-field', text: 'Когда' }));
-    card.appendChild(whenField(option, form, update, quiet));
-    card.appendChild(h('label', { class: 'esh-field', text: 'Где' }));
-    card.appendChild(whereField(option, form, update, quiet));
+    if (speciality) {
+      const clinic = option.source.clinic;
+      card.appendChild(h('p', { class: 'esh-note', text: clinic.title + ' — ' + clinic.address }));
+      card.appendChild(h('p', { class: 'esh-note', text: option.source.purpose.title }));
+      card.appendChild(h('label', { class: 'esh-field' }, [
+        'Дата приёма',
+        h('input', { type: 'date', min: core.today(), value: form.day, onchange: (e) => quiet({ day: e.target.value }) }),
+      ]));
+    } else {
+      card.appendChild(h('label', { class: 'esh-field', text: 'Когда' }));
+      card.appendChild(whenField(option, form, update, quiet));
+      card.appendChild(h('label', { class: 'esh-field', text: 'Где' }));
+      card.appendChild(whereField(option, form, update, quiet));
+    }
     const purpose = purposeField(option, form, update);
     if (purpose) card.appendChild(purpose);
     card.appendChild(h('label', { class: 'esh-row' }, [
@@ -2530,7 +2928,7 @@ SOFTWARE.
         h('span', { text: 'сначала спрашивать' }),
       ]),
     ]));
-    card.appendChild(advancedFields(form, quiet));
+    if (!speciality) card.appendChild(advancedFields(form, quiet));
     const error = stepTwoError(option, form);
     const errorEl = h('p', { class: 'esh-warn', text: error || '', hidden: !error });
     errorEl.dataset.optionId = option.id;
@@ -2539,6 +2937,7 @@ SOFTWARE.
   }
 
   function stepTwoError(option, form) {
+    if (option.scenario === 'bookSpeciality' && form.day && form.day < core.today()) return 'выберите сегодняшнюю или будущую дату';
     if (form.when === 'onlyDay' && !form.day) return 'выберите день';
     if (form.where === 'contains' && !form.addressContains.trim()) return 'укажите часть адреса';
     return null;
@@ -2598,6 +2997,8 @@ SOFTWARE.
     const [head, ...rest] = text.split('\n');
     const box = h('div', { class: 'esh-opt' });
     box.appendChild(h('p', { text: head }));
+    const target = wizard.builtTargets?.find((t) => t.id === item.targetId && t.scenario === 'bookSpeciality');
+    if (target) box.appendChild(h('p', { class: 'esh-note', text: ui.describeTarget(target) }));
     for (const line of rest) {
       const warn = line.trim().startsWith('⚠');
       box.appendChild(h('p', { class: warn ? 'esh-warn' : 'esh-note', text: line.trim() }));
@@ -2650,7 +3051,7 @@ SOFTWARE.
       runningFor = wizard.report.targetsHash;
       // Minor: сразу после старта проверок ещё не было — не выдумываем время
       // последней проверки.
-      setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: 'первая проверка через минуту' });
+      setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: 'ожидаю первую проверку' });
       startStatusRefresh();
       openWizard(4);
     } catch (e) {
@@ -2686,7 +3087,11 @@ SOFTWARE.
       ? `${p.payload.title}: перенесу с ${ui.human(current)} на ${ui.human(p.payload.slot.startTime)}`
       : `${p.payload.title}: запишу на ${ui.human(p.payload.slot.startTime)}`;
     card.appendChild(h('p', { text: headText }));
-    if (p.payload.address) card.appendChild(h('p', { class: 'esh-note', text: ui.stripCampus(p.payload.address) }));
+    if (p.payload.name) card.appendChild(h('p', { class: 'esh-note', text: p.payload.name }));
+    if (p.payload.address) {
+      const address = p.payload.exactAddress ? p.payload.address : ui.stripCampus(p.payload.address);
+      card.appendChild(h('p', { class: 'esh-note', text: address }));
+    }
     card.appendChild(h('p', { class: 'esh-note', text: `Осталось ${left} с` }));
     card.appendChild(h('div', { class: 'esh-btns' }, [
       h('button', { class: 'esh-btn', text: 'Пропустить', onclick: () => answerConfirm(targetId, 'skip') }),
@@ -2915,6 +3320,12 @@ SOFTWARE.
     const cfg = ui.loadConfig(storage) || {};
     ui.saveConfig(storage, { ...cfg, enabled: false });
     finishedAll = true;
+    const stopped = all.find((t) => t.state === 'stopped');
+    if (stopped) {
+      notify('ЕМИАС: поиск остановлен', stopped.note);
+      if (!showBookedBadge()) setBadge({ kind: 'stopped', text: '🔴 Поиск остановлен', detail: stopped.note || '' });
+      return;
+    }
     notify('ЕМИАС: поиск завершён', 'Все цели выполнены, охотник остановился');
     if (!showBookedBadge()) setBadge({ kind: 'idle', text: '✅ Готово', detail: 'все цели выполнены' });
   }

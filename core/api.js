@@ -86,7 +86,13 @@
       return request('GET', path, undefined, retried);
     }
 
-    return { post, get, backoffUntil: () => backoffUntil, SessionError };
+    function getForPatient(path, params) {
+      const { oms, birth } = session.identity();
+      const query = new URLSearchParams({ ...params, omsNumber: oms, birthDate: birth });
+      return get(path + '?' + query.toString());
+    }
+
+    return { post, get, getForPatient, backoffUntil: () => backoffUntil, SessionError };
   }
 
   const api = { createApi, SessionError };

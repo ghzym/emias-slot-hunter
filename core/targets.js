@@ -4,7 +4,7 @@
 (function (root) {
   'use strict';
 
-  function createTargets({ api, filters, util }) {
+  function createTargets({ api, filters, util, speciality }) {
     const { toMs, campus } = util;
 
     // Поддерживаются только эти сценарии. Всё остальное (например,
@@ -100,6 +100,7 @@
     }
 
     async function search(t, ctx) {
+      if (t.scenario === 'bookSpeciality' && speciality) return speciality.search(t, ctx);
       if (!SUPPORTED_SCENARIOS.has(t.scenario)) {
         return { candidates: [], rejected: [], notes: [UNSUPPORTED_MESSAGE], action: null };
       }
@@ -237,6 +238,7 @@
     }
 
     async function act(t, cand, ctx) {
+      if (t.scenario === 'bookSpeciality' && speciality) return speciality.book(t, cand, ctx);
       const base = {
         availableResourceId: cand.resourceId, complexResourceId: cand.complexResourceId,
         startTime: cand.slot.startTime, endTime: cand.slot.endTime,

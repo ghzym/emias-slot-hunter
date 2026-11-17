@@ -24,6 +24,7 @@
     const dayHuman = (ymd) => { const d = String(ymd).split('-'); return `${Number(d[2])} ${MONTHS[Number(d[1]) - 1]}`; };
 
     function buildTarget(option, form) {
+      const speciality = option.scenario === 'bookSpeciality';
       // form.when — три взаимоисключающих варианта:
       //  - 'earlier': раньше текущей записи, день любой (onlyDay=null, anyTime=false);
       //  - 'sameDayEarlier': в тот же день, что текущая запись, но раньше неё
@@ -56,14 +57,14 @@
         deadline,
         timeFrom: form.timeFrom || null,
         timeTo: form.timeTo || null,
-        addressContains: form.where === 'sameCampus' ? stripCampus(option.address)
+        addressContains: speciality ? null : form.where === 'sameCampus' ? stripCampus(option.address)
           : form.where === 'contains' ? (form.addressContains || null) : null,
         prefer: form.preferUntil ? { until: form.preferUntil, timeTo: form.preferTimeTo || null } : null,
         near: form.nearStart && form.nearEnd ? { start: form.nearStart, end: form.nearEnd } : null,
         respectTravel: form.respectTravel !== false,
         travelMs: 60 * 60000,
-        minLeadMs: 2 * 60 * 60000,
-        keepImproving: option.scenario !== 'bookReferral',
+        minLeadMs: speciality ? 0 : 2 * 60 * 60000,
+        keepImproving: !speciality && option.scenario !== 'bookReferral',
         mode: form.mode === 'confirm' ? 'confirm' : 'auto',
         purpose: (option.source && option.source.needPurpose) ? (() => {
           const chosen = INQUIRY_PURPOSES[form.purpose === 'documents' ? 'documents' : 'unwell'];
@@ -79,6 +80,9 @@
 
     function describeTarget(t) {
       const parts = [];
+      if (t.scenario === 'bookSpeciality') {
+        parts.push(t.source.clinic.title + ' — ' + t.source.clinic.address, t.source.purpose.title);
+      }
       if (t.near) parts.push(`подгоняю ближе к ${human(t.near.start)}–${String(t.near.end).slice(11, 16)}`);
       else if (t.onlyDay && t.anyTime) parts.push(`любое время ${dayHuman(t.onlyDay)}`);
       else if (t.onlyDay && t.current) parts.push(`${dayHuman(t.onlyDay)}, раньше ${human(t.current)}`);
@@ -121,9 +125,9 @@
     }
 
     function describeDryRunItem(item) {
-      const head = item.waiting
-        ? `${item.title}: подходящих слотов сейчас нет, жду`
-        : `${item.title}: взяла бы ${human(item.would.startTime)} — ${item.would.address}`;
+      let head = item.title;
+      if (item.would) head += `: взяла бы ${human(item.would.startTime)} — ${item.would.address}`;
+      else if (item.waiting) head += ': подходящих слотов сейчас нет, жду';
       const warn = (item.warnings || []).map((w) => `\n  ⚠ ${w}`).join('');
       const notes = (item.notes || []).map((n) => `\n  · ${n}`).join('');
       return head + warn + notes;

@@ -116,7 +116,8 @@
     const session = M.createSession({ storage, fetch, now });
     const api = M.createApi({ session, errors, fetch, now });
     const discover = M.createDiscover({ api, today: () => util.mskDate(new Date(now())) });
-    const targets = M.createTargets({ api, filters, util });
+    const speciality = M.createSpeciality?.({ api, filters, util, now, profileKey: specialityProfileKey });
+    const targets = M.createTargets({ api, filters, util, speciality });
 
     // Простая шина событий: подписка по типу события ('log', 'found',
     // 'booked', 'needConfirm', 'sessionLost', 'stale', 'slept', 'standby', ...)
@@ -227,9 +228,26 @@
     // вызывающий код попросит ввести их. Ошибка сессии (SessionError из
     // api.get) наоборот НЕ гасится — это не «не нашли данные», а настоящая
     // потеря входа, и она должна дойти до вызывающего кода как есть.
+    function selectedPolicy() {
+      try { return JSON.parse(JSON.parse(storage.getItem('persist:persist')).persistOmsNumber); } catch { return null; }
+    }
+
+    async function specialityProfileKey() {
+      const oms = selectedPolicy();
+      if (!oms || !siteLoggedIn() || session.identity().oms !== oms) return null;
+      const key = 'emiasSlotHunter:profileSalt';
+      let salt = storage.getItem(key);
+      if (!salt) {
+        salt = crypto.randomUUID();
+        storage.setItem(key, salt);
+      }
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(salt + ':' + oms));
+      if (selectedPolicy() !== oms || !siteLoggedIn() || session.identity().oms !== oms) return null;
+      return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+    }
+
     async function identityFromStorage() {
-      let oms = null;
-      try { oms = JSON.parse(JSON.parse(storage.getItem('persist:persist')).persistOmsNumber); } catch (e) { oms = null; }
+      const oms = selectedPolicy();
       let birth = null;
       try {
         const t = JSON.parse(JSON.parse(storage.getItem('persist:sessionAuth')).idToken);
@@ -266,7 +284,7 @@
     // поддержан целиком (см. targets.js), «улучшать» там нечего. Явное
     // keepImproving: false в цели отключает поведение.
     function normalizeTarget(t) {
-      return { ...t, keepImproving: t.keepImproving !== false && t.scenario !== 'bookReferral' };
+      return { ...t, keepImproving: t.keepImproving !== false && !['bookReferral', 'bookSpeciality'].includes(t.scenario) };
     }
 
     return {
@@ -274,8 +292,11 @@
       discover: () => discover.list(),
       listSpecialities: async () => {
         await init();
-        return discover.listSpecialities();
+        return discover.listSpecialities({ details: true });
       },
+      specialityPurposes: (group) => speciality.purposes(group),
+      specialityDepartments: (group, purpose, account, member) => speciality.departments(group, purpose, account, member),
+      today: () => util.mskDate(new Date(now())),
       setTargets: (list) => runner.setTargets(list.map(normalizeTarget)),
       dryRun: () => runner.dryRun(),
       confirmDryRun: (id) => runner.confirmDryRun(id),

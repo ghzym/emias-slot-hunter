@@ -98,7 +98,7 @@
       return out;
     }
 
-    async function listSpecialities() {
+    async function listSpecialities({ details = false } = {}) {
       const res = await api.post('v7/saOrchestrator/getSpecialitiesInfo', { isChatBotEnabled: false });
       if (!res.ok) {
         throw new Error(res.explained?.message || 'ЕМИАС не отдал список специальностей');
@@ -116,7 +116,21 @@
         const code = codes.find((value) => !seen.has(value));
         for (const value of codes) seen.add(value);
         const title = typeof group?.title === 'string' ? group.title.trim() : '';
-        if (code && title && group.code !== 'pin') choices.push({ code, title });
+        if (!code || !title || group.code === 'pin') continue;
+        const choice = { code, title };
+        if (details) {
+          choice.group = group.code;
+          choice.members = group.specialities.filter((item) => codes.includes(String(item?.specialityCode)))
+            .map((item) => ({
+              code: String(item.specialityCode),
+              title: item.specialityName || title,
+              clinicSelection: item.ignoreAttachment === true,
+              multipleClinics: item.isMultipleLpuSpeciality === true,
+              paid: item.paid === true,
+              certificate: Array.isArray(item.certificates) && item.certificates.length > 0,
+            }));
+        }
+        choices.push(choice);
       }
       return choices.sort((a, b) => a.title.localeCompare(b.title, 'ru'));
     }

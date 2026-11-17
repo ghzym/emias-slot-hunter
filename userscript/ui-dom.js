@@ -204,7 +204,7 @@
       .esh-badge.k-booked { background: #e08a2b; }
       .esh-badge.k-standby { background: #3a7bd5; }
       .esh-badge.k-paused { background: #8a6d3b; }
-      .esh-badge.k-needLogin, .esh-badge.k-needIdentity, .esh-badge.k-sessionLost, .esh-badge.k-stale, .esh-badge.k-resumeError, .esh-badge.k-needDryRun { background: #d64545; }
+      .esh-badge.k-needLogin, .esh-badge.k-needIdentity, .esh-badge.k-sessionLost, .esh-badge.k-stale, .esh-badge.k-resumeError, .esh-badge.k-needDryRun, .esh-badge.k-stopped { background: #d64545; }
       .esh-sub { display: block; font-size: 11px; opacity: .85; font-weight: normal; }
       .esh-card { width: 320px; max-width: calc(100vw - 32px); box-sizing: border-box; max-height: 70vh; overflow: auto; background: #fff; color: #222; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,.3); padding: 14px; }
       .esh-card h3 { margin: 0 0 8px; font-size: 16px; }
@@ -289,6 +289,7 @@
     if (kind === 'resumeError') { resumeIfEnabled(); return; }
     if (kind === 'standby') { openStandbyPanel(); return; }
     if (kind === 'booked') { acknowledgeBooked(); openStatusPanel(); return; }
+    if (kind === 'stopped') { openStatusPanel(); return; }
     if (kind === 'running' || kind === 'resuming') { openStatusPanel(); return; }
     // needDryRun и любой прочий случай — безопаснее всего начать настройку заново.
     openWizardGuarded(1);
@@ -441,7 +442,9 @@
     const logBox = renderLog(logEvents);
     dom.panel.appendChild(logBox);
     logBox.scrollTop = logScrollTop;
-    const stopBtn = h('button', { class: 'esh-btn danger', text: 'Остановить поиск', onclick: onStop });
+    const stopBtn = st.running
+      ? h('button', { class: 'esh-btn danger', text: 'Остановить поиск', onclick: onStop })
+      : h('button', { class: 'esh-btn', text: 'Настроить', onclick: () => openWizardGuarded(1) });
     dom.panel.appendChild(h('div', { class: 'esh-btns' }, [stopBtn]));
   }
 
@@ -529,6 +532,7 @@
   }
 
   function describeOptionMeta(option) {
+    if (option.scenario === 'bookSpeciality') return option.source.clinic.title + ' — ' + option.address;
     const parts = [];
     if (option.current) parts.push('сейчас записано на ' + ui.human(option.current));
     if (option.address) parts.push(ui.stripCampus(option.address));
@@ -540,7 +544,7 @@
     clear(dom.panel);
     dom.panel.appendChild(h('h3', { text: 'Шаг 1 из 3. За чем следить' }));
     dom.panel.appendChild(h('div', { class: 'esh-btns' }, [
-      h('button', { class: 'esh-btn', text: 'Записаться по специальности', onclick: loadSpecialities }),
+      h('button', { class: 'esh-btn', text: 'Найти слот по специальности', onclick: loadSpecialities }),
     ]));
     if (!options.length) {
       dom.panel.appendChild(h('p', { class: 'esh-note', text: 'Направлений и записей, с которыми можно работать, не найдено.' }));
@@ -555,46 +559,92 @@
     dom.panel.appendChild(h('div', { class: 'esh-btns' }, [next]));
   }
 
-  async function loadSpecialities() {
-    const heading = 'Запись по специальности';
-    const back = h('button', { class: 'esh-btn', text: 'Назад', onclick: backToStep1 });
+  async function loadSpecialityScreen(heading, request, render, onBack) {
+    const back = h('button', { class: 'esh-btn', text: 'Назад', onclick: onBack });
     renderLoading(heading);
     const requestHeading = dom.panel.firstChild;
     dom.panel.appendChild(h('div', { class: 'esh-btns' }, [back]));
-    let choices;
+    const active = () => panelMode === 'wizard' && dom.panel.firstChild === requestHeading;
+    let data;
     try {
-      choices = await core.listSpecialities();
+      data = await request();
     } catch (error) {
-      if (panelMode !== 'wizard' || dom.panel.firstChild !== requestHeading) return;
-      renderLoadError(heading, error.message, loadSpecialities);
+      if (!active()) return;
+      renderLoadError(heading, error.message, () => loadSpecialityScreen(heading, request, render, onBack));
       dom.panel.lastChild.prepend(back);
       return;
     }
-    if (panelMode !== 'wizard' || dom.panel.firstChild !== requestHeading) return;
+    if (active()) render(data);
+  }
+
+  function renderSpecialityChoice(heading, label, choices, onSelect, onBack, emptyText) {
+    const back = h('button', { class: 'esh-btn', text: 'Назад', onclick: onBack });
     clear(dom.panel);
     dom.panel.appendChild(h('h3', { text: heading }));
     if (!choices.length) {
-      dom.panel.appendChild(h('p', { class: 'esh-note', text: 'ЕМИАС не показал специальностей для самостоятельной записи.' }));
+      dom.panel.appendChild(h('p', { class: 'esh-note', text: emptyText }));
       dom.panel.appendChild(h('div', { class: 'esh-btns' }, [back]));
       return;
     }
 
-    const select = h('select', { id: 'esh-speciality', class: 'esh-speciality-select' }, [
-      h('option', { value: '', text: 'Выберите специальность' }),
-      ...choices.map(({ code, title }) => h('option', { value: code, text: title })),
+    const select = h('select', { id: 'esh-speciality-choice', class: 'esh-speciality-select' }, [
+      h('option', { value: '', text: 'Выберите из списка' }),
+      ...choices.map((choice, index) => h('option', { value: String(index), text: choice.title })),
     ]);
     const next = h('button', {
-      class: 'esh-btn primary', text: 'Продолжить в ЕМИАС', disabled: true,
+      class: 'esh-btn primary', text: 'Далее', disabled: true,
       onclick: () => {
-        const selected = choices.find(({ code }) => code === select.value);
-        if (selected) window.location.assign('/app/einfo/#/create?s=' + encodeURIComponent(selected.code));
+        if (select.value !== '') onSelect(choices[Number(select.value)]);
       },
     });
+    if (choices.length === 1) { select.value = '0'; next.disabled = false; }
     select.addEventListener('change', () => { next.disabled = !select.value; });
-    dom.panel.appendChild(h('label', { class: 'esh-field', for: 'esh-speciality', text: 'Специальность' }));
+    dom.panel.appendChild(h('label', { class: 'esh-field', for: 'esh-speciality-choice', text: label }));
     dom.panel.appendChild(select);
-    dom.panel.appendChild(h('p', { class: 'esh-note', text: 'Цель визита, врача и время выберите на странице ЕМИАС.' }));
     dom.panel.appendChild(h('div', { class: 'esh-btns' }, [back, next]));
+  }
+
+  function loadSpecialities() {
+    const heading = 'Поиск слота по специальности';
+    loadSpecialityScreen(heading, () => core.listSpecialities(), (groups) => {
+      renderSpecialityChoice(heading, 'Специальность', groups, loadSpecialityPurposes, backToStep1,
+        'ЕМИАС не показал специальностей для самостоятельной записи.');
+    }, backToStep1);
+  }
+
+  function loadSpecialityPurposes(group) {
+    loadSpecialityScreen(group.title, () => core.specialityPurposes(group), ({ account, choices }) => {
+      renderSpecialityChoice(group.title, 'Цель визита', choices, (purpose) => {
+        const back = () => loadSpecialityPurposes(group);
+        if (group.group !== 'dermatology') {
+          loadSpecialityDepartments(group, purpose, account, null, back);
+          return;
+        }
+        const members = group.members.filter((m) => !m.paid && !m.certificate &&
+          (window.EINFO_CONFIG?.APP_TOGGLE_VENEROLOGY_OPENED === true || !/(^|[^а-яё])венеролог/iu.test(m.title)));
+        const showMembers = () => renderSpecialityChoice(group.title, 'Вариант приёма', members,
+          (member) => loadSpecialityDepartments(group, purpose, account, member, showMembers), back,
+          'ЕМИАС не показал доступных вариантов очного приёма.');
+        showMembers();
+      }, loadSpecialities, 'ЕМИАС не показал доступных целей для очного приёма.');
+    }, loadSpecialities);
+  }
+
+  function loadSpecialityDepartments(group, purpose, account, member, back) {
+    const title = member && member.title !== group.title ? member.title : group.title;
+    loadSpecialityScreen(title, () => core.specialityDepartments(group, purpose, account, member?.code), (result) => {
+      const choices = result.clinics.map((clinic) => ({ title: clinic.title + ' — ' + clinic.address, clinic }));
+      renderSpecialityChoice(title, 'Отделение', choices, ({ clinic }) => {
+        const id = ['speciality', group.code, member?.code || '', purpose.id, clinic.id, clinic.address].join('|');
+        const option = {
+          id, title, scenario: 'bookSpeciality', address: clinic.address,
+          source: { ...result.source, clinic },
+        };
+        wizard.options = [...wizard.options.filter((o) => o.id !== id), option];
+        toggleOption(option, true);
+        openWizard(2);
+      }, back, 'ЕМИАС пока не показывает отделений для выбранной цели визита.');
+    }, back);
   }
 
   /* ==================== шаг 2: условия для каждого выбранного пункта ==================== */
@@ -602,10 +652,11 @@
     if (!wizard.forms[option.id]) {
       wizard.forms[option.id] = {
         // Для новой записи 'earlier' показывается как «как можно раньше».
-        when: 'earlier',
+        when: option.scenario === 'bookSpeciality' ? 'onlyDay' : 'earlier',
         day: '', dateFrom: '', dateTo: '', timeFrom: '', timeTo: '',
         where: option.address ? 'sameCampus' : 'any', addressContains: '',
-        respectTravel: true, mode: 'auto', purpose: 'unwell',
+        respectTravel: option.scenario !== 'bookSpeciality',
+        mode: option.scenario === 'bookSpeciality' ? 'confirm' : 'auto', purpose: 'unwell',
       };
     }
     return wizard.forms[option.id];
@@ -684,11 +735,22 @@
     // год с клавиатуры было не набрать. Обновляем только ошибку и «Далее».
     const quiet = (patch) => { Object.assign(form, patch); refreshStepTwoState(); };
     const card = h('div', { class: 'esh-opt' });
+    const speciality = option.scenario === 'bookSpeciality';
     card.appendChild(h('div', { class: 'title', text: option.title }));
-    card.appendChild(h('label', { class: 'esh-field', text: 'Когда' }));
-    card.appendChild(whenField(option, form, update, quiet));
-    card.appendChild(h('label', { class: 'esh-field', text: 'Где' }));
-    card.appendChild(whereField(option, form, update, quiet));
+    if (speciality) {
+      const clinic = option.source.clinic;
+      card.appendChild(h('p', { class: 'esh-note', text: clinic.title + ' — ' + clinic.address }));
+      card.appendChild(h('p', { class: 'esh-note', text: option.source.purpose.title }));
+      card.appendChild(h('label', { class: 'esh-field' }, [
+        'Дата приёма',
+        h('input', { type: 'date', min: core.today(), value: form.day, onchange: (e) => quiet({ day: e.target.value }) }),
+      ]));
+    } else {
+      card.appendChild(h('label', { class: 'esh-field', text: 'Когда' }));
+      card.appendChild(whenField(option, form, update, quiet));
+      card.appendChild(h('label', { class: 'esh-field', text: 'Где' }));
+      card.appendChild(whereField(option, form, update, quiet));
+    }
     const purpose = purposeField(option, form, update);
     if (purpose) card.appendChild(purpose);
     card.appendChild(h('label', { class: 'esh-row' }, [
@@ -706,7 +768,7 @@
         h('span', { text: 'сначала спрашивать' }),
       ]),
     ]));
-    card.appendChild(advancedFields(form, quiet));
+    if (!speciality) card.appendChild(advancedFields(form, quiet));
     const error = stepTwoError(option, form);
     const errorEl = h('p', { class: 'esh-warn', text: error || '', hidden: !error });
     errorEl.dataset.optionId = option.id;
@@ -715,6 +777,7 @@
   }
 
   function stepTwoError(option, form) {
+    if (option.scenario === 'bookSpeciality' && form.day && form.day < core.today()) return 'выберите сегодняшнюю или будущую дату';
     if (form.when === 'onlyDay' && !form.day) return 'выберите день';
     if (form.where === 'contains' && !form.addressContains.trim()) return 'укажите часть адреса';
     return null;
@@ -774,6 +837,8 @@
     const [head, ...rest] = text.split('\n');
     const box = h('div', { class: 'esh-opt' });
     box.appendChild(h('p', { text: head }));
+    const target = wizard.builtTargets?.find((t) => t.id === item.targetId && t.scenario === 'bookSpeciality');
+    if (target) box.appendChild(h('p', { class: 'esh-note', text: ui.describeTarget(target) }));
     for (const line of rest) {
       const warn = line.trim().startsWith('⚠');
       box.appendChild(h('p', { class: warn ? 'esh-warn' : 'esh-note', text: line.trim() }));
@@ -826,7 +891,7 @@
       runningFor = wizard.report.targetsHash;
       // Minor: сразу после старта проверок ещё не было — не выдумываем время
       // последней проверки.
-      setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: 'первая проверка через минуту' });
+      setBadge({ kind: 'running', text: '🟢 Ищу слоты', detail: 'ожидаю первую проверку' });
       startStatusRefresh();
       openWizard(4);
     } catch (e) {
@@ -862,7 +927,11 @@
       ? `${p.payload.title}: перенесу с ${ui.human(current)} на ${ui.human(p.payload.slot.startTime)}`
       : `${p.payload.title}: запишу на ${ui.human(p.payload.slot.startTime)}`;
     card.appendChild(h('p', { text: headText }));
-    if (p.payload.address) card.appendChild(h('p', { class: 'esh-note', text: ui.stripCampus(p.payload.address) }));
+    if (p.payload.name) card.appendChild(h('p', { class: 'esh-note', text: p.payload.name }));
+    if (p.payload.address) {
+      const address = p.payload.exactAddress ? p.payload.address : ui.stripCampus(p.payload.address);
+      card.appendChild(h('p', { class: 'esh-note', text: address }));
+    }
     card.appendChild(h('p', { class: 'esh-note', text: `Осталось ${left} с` }));
     card.appendChild(h('div', { class: 'esh-btns' }, [
       h('button', { class: 'esh-btn', text: 'Пропустить', onclick: () => answerConfirm(targetId, 'skip') }),
@@ -1091,6 +1160,12 @@
     const cfg = ui.loadConfig(storage) || {};
     ui.saveConfig(storage, { ...cfg, enabled: false });
     finishedAll = true;
+    const stopped = all.find((t) => t.state === 'stopped');
+    if (stopped) {
+      notify('ЕМИАС: поиск остановлен', stopped.note);
+      if (!showBookedBadge()) setBadge({ kind: 'stopped', text: '🔴 Поиск остановлен', detail: stopped.note || '' });
+      return;
+    }
     notify('ЕМИАС: поиск завершён', 'Все цели выполнены, охотник остановился');
     if (!showBookedBadge()) setBadge({ kind: 'idle', text: '✅ Готово', detail: 'все цели выполнены' });
   }
