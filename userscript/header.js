@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         ЕМИАС: охотник за слотами
 // @namespace    https://github.com/polinalamponi/emias-slot-hunter
-// @version      0.1.7
+// @version      0.1.8
 // @description  Ищет слоты ЕМИАС по специальности, дате и отделению, а также по направлениям и существующим записям
 // @author       polinalamponi
 // @license      MIT

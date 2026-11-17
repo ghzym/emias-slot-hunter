@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ЕМИАС: охотник за слотами
 // @namespace    https://github.com/polinalamponi/emias-slot-hunter
-// @version      0.1.7
+// @version      0.1.8
 // @description  Ищет слоты ЕМИАС по специальности, дате и отделению, а также по направлениям и существующим записям
 // @author       polinalamponi
 // @license      MIT
@@ -45,7 +45,7 @@ SOFTWARE.
 (function (root) {
   'use strict';
 
-  const VERSION = '0.1.7';
+  const VERSION = '0.1.8';
   const TZ = 'Europe/Moscow';
 
   function createUtil() {
@@ -2180,18 +2180,19 @@ SOFTWARE.
 
   /* ==================== состояние мастера (переменная модуля) ==================== */
   // Ничего отсюда не пишется в хранилище раньше шага 3 — см. requirements.
-  const wizard = {
-    open: false,
-    step: 0,
-    options: [],        // результат discover()
-    selected: [],        // выбранные варианты (option) с шага 1
-    forms: {},           // option.id -> форма условий с шага 2
-    report: null,         // результат dryRun() для текущих целей
-    builtTargets: null,    // цели, переданные в core.setTargets перед прогоном
-    checked: false,         // галочка «Я проверил(а)» на шаге 3
-    loading: false,          // идёт discover()/dryRun()
-    loadError: null,          // текст ошибки связи + что повторять
-  };
+  function newWizard() {
+    return {
+      open: false,
+      step: 0,
+      options: [],      // варианты из ЕМИАС и добавленные специальности
+      selected: [],     // выбранные варианты с шага 1
+      forms: {},        // option.id -> форма условий с шага 2
+      report: null,     // результат холостого прогона
+      builtTargets: null,
+      checked: false,   // галочка «Я проверил(а)» на шаге 3
+    };
+  }
+  let wizard = newWizard();
 
   let core = null;
   let badgeState = { kind: 'init', text: '…', detail: '' };
@@ -2377,6 +2378,8 @@ SOFTWARE.
       .esh-opt .reason { font-size: 12px; color: #a33; }
       .esh-field { display: block; font-size: 12px; margin: 6px 0 2px; color: #444; }
       .esh-speciality-select { width: 100%; box-sizing: border-box; padding: 8px; font: inherit; }
+      .esh-target-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+      .esh-target-head .esh-btn { flex: none; padding: 4px 6px; }
       .esh-card input[type=text], .esh-card input[type=date], .esh-card input[type=time] { width: 100%; padding: 4px 6px; margin-top: 4px; font-size: 13px; border: 1px solid #ccc; border-radius: 6px; }
       .esh-btns { display: flex; gap: 8px; margin-top: 12px; }
       .esh-btn { flex: 1; padding: 8px 10px; border-radius: 8px; border: 1px solid #ccc; background: #f4f4f4; cursor: pointer; font-size: 13px; }
@@ -2480,6 +2483,7 @@ SOFTWARE.
     if (badgeState.kind === 'standby') setBadge({ kind: 'paused', text: '⏸ Поиск приостановлен', detail: 'идёт настройка' });
     const cfg = ui.loadConfig(storage);
     if (cfg && cfg.enabled && !cfg.paused) ui.saveConfig(storage, { ...cfg, paused: true, pausedAt: Date.now() });
+    wizard = newWizard();
     openWizard(step);
   }
 
@@ -2642,6 +2646,12 @@ SOFTWARE.
     dom.panel.appendChild(h('p', { class: 'esh-note', text: 'Спрашиваю ЕМИАС, подождите…' }));
   }
 
+  function watchWizardScreen() {
+    const draft = wizard;
+    const heading = dom.panel.firstChild;
+    return () => panelMode === 'wizard' && wizard === draft && dom.panel.firstChild === heading;
+  }
+
   function renderLoadError(title, message, onRetry) {
     clear(dom.panel);
     dom.panel.appendChild(h('h3', { text: title }));
@@ -2654,12 +2664,14 @@ SOFTWARE.
   /* ==================== шаг 1: выбор направлений и записей ==================== */
   async function loadStep1() {
     renderLoading('Шаг 1 из 3. За чем следить');
+    const active = watchWizardScreen();
     try {
       const options = await core.discover();
+      if (!active()) return;
       wizard.options = options;
       renderStep1(options);
     } catch (e) {
-      renderLoadError('Шаг 1 из 3. За чем следить', e && e.message, loadStep1);
+      if (active()) renderLoadError('Шаг 1 из 3. За чем следить', e && e.message, loadStep1);
     }
   }
 
@@ -2722,9 +2734,8 @@ SOFTWARE.
   async function loadSpecialityScreen(heading, request, render, onBack) {
     const back = h('button', { class: 'esh-btn', text: 'Назад', onclick: onBack });
     renderLoading(heading);
-    const requestHeading = dom.panel.firstChild;
+    const active = watchWizardScreen();
     dom.panel.appendChild(h('div', { class: 'esh-btns' }, [back]));
-    const active = () => panelMode === 'wizard' && dom.panel.firstChild === requestHeading;
     let data;
     try {
       data = await request();
@@ -2896,9 +2907,16 @@ SOFTWARE.
     const quiet = (patch) => { Object.assign(form, patch); refreshStepTwoState(); };
     const card = h('div', { class: 'esh-opt' });
     const speciality = option.scenario === 'bookSpeciality';
-    card.appendChild(h('div', { class: 'title', text: option.title }));
+    const title = h('div', { class: 'title', text: option.title });
     if (speciality) {
       const clinic = option.source.clinic;
+      card.appendChild(h('div', { class: 'esh-target-head' }, [
+        title,
+        h('button', {
+          class: 'esh-btn', text: 'Убрать цель', 'aria-label': 'Убрать цель для ' + clinic.title,
+          onclick: () => removeSpecialityGoal(option),
+        }),
+      ]));
       card.appendChild(h('p', { class: 'esh-note', text: clinic.title + ' — ' + clinic.address }));
       card.appendChild(h('p', { class: 'esh-note', text: option.source.purpose.title }));
       card.appendChild(h('label', { class: 'esh-field' }, [
@@ -2906,6 +2924,7 @@ SOFTWARE.
         h('input', { type: 'date', min: core.today(), value: form.day, onchange: (e) => quiet({ day: e.target.value }) }),
       ]));
     } else {
+      card.appendChild(title);
       card.appendChild(h('label', { class: 'esh-field', text: 'Когда' }));
       card.appendChild(whenField(option, form, update, quiet));
       card.appendChild(h('label', { class: 'esh-field', text: 'Где' }));
@@ -2941,6 +2960,14 @@ SOFTWARE.
     if (form.when === 'onlyDay' && !form.day) return 'выберите день';
     if (form.where === 'contains' && !form.addressContains.trim()) return 'укажите часть адреса';
     return null;
+  }
+
+  function removeSpecialityGoal(option) {
+    toggleOption(option, false);
+    wizard.options = wizard.options.filter((o) => o.id !== option.id);
+    delete wizard.forms[option.id];
+    if (wizard.selected.length) renderStep2(wizard.selected);
+    else backToStep1();
   }
 
   // «Назад» на шаге 1: варианты уже получены discover()-ом при первом входе
@@ -2981,14 +3008,17 @@ SOFTWARE.
   /* ==================== шаг 3: холостой прогон и запуск ==================== */
   async function loadStep3() {
     renderLoading('Шаг 3 из 3. Проверка перед запуском');
+    const active = watchWizardScreen();
     wizard.builtTargets = wizard.selected.map((o) => ui.buildTarget(o, ensureForm(o)));
     core.setTargets(wizard.builtTargets);
     try {
-      wizard.report = await core.dryRun();
+      const report = await core.dryRun();
+      if (!active()) return;
+      wizard.report = report;
       wizard.checked = false;
       renderStep3(wizard.report);
     } catch (e) {
-      renderLoadError('Шаг 3 из 3. Проверка перед запуском', e && e.message, loadStep3);
+      if (active()) renderLoadError('Шаг 3 из 3. Проверка перед запуском', e && e.message, loadStep3);
     }
   }
 
